@@ -60,7 +60,7 @@ PHONE_IP = "YOUR_PHONE_IP"  # ← SET THIS to your phone's IP address
 
 # True  = use laptop webcam (good for testing)
 # False = connect to phone stream (set PHONE_IP first)
-USE_WEBCAM_FALLBACK = False
+USE_WEBCAM_FALLBACK = True
 
 # All URLs tried in order when USE_WEBCAM_FALLBACK = False.
 # The script auto-detects which one works — no need to pick manually.
@@ -107,7 +107,13 @@ HIT_SHRINK_Y      = 0.05
 
 # BOX_SMOOTH_SPEED: how fast the displayed box glides to the new detected position (per second)
 #                   Higher = snappier, lower = smoother. 8 is a good balance.
-BOX_SMOOTH_SPEED  = 8.0
+BOX_SMOOTH_SPEED  = 4.0
+
+# ─── SOUND CONFIG ─────────────────────────────────────────────
+#
+#  SOUND_VOLUME : master volume for all sound effects (0.0 = silent, 1.0 = full)
+#
+SOUND_VOLUME = 0.8
 
 # ─── SERIAL (Pico 1 USB) CONFIG ───────────────────────────────
 #
@@ -166,12 +172,13 @@ class NPC:
     MAX_HEALTH = 100
 
     def __init__(self, x1, y1, x2, y2):
-        self.box         = (x1, y1, x2, y2)
-        self.display_box = (float(x1), float(y1), float(x2), float(y2))  # smoothed
-        self.health      = self.MAX_HEALTH
-        self.last_seen   = time.time()
-        self.hit_flash   = 0.0   # seconds of hit-flash remaining
-        self.kill_time   = None  # set when health → 0
+        self.box            = (x1, y1, x2, y2)
+        self.display_box    = (float(x1), float(y1), float(x2), float(y2))  # smoothed
+        self.health         = self.MAX_HEALTH
+        self.display_health = float(self.MAX_HEALTH)   # smoothed health for bar rendering
+        self.last_seen      = time.time()
+        self.hit_flash      = 0.0   # seconds of hit-flash remaining
+        self.kill_time      = None  # set when health → 0
 
 
 # ─── DETECTION WORKER ─────────────────────────────────────────
@@ -358,6 +365,7 @@ class HitMarker:
 
 class FPSGame:
     def __init__(self):
+        pygame.mixer.pre_init(frequency=44100, size=-16, channels=2, buffer=512)
         pygame.init()
         pygame.display.set_caption("ROBO-HUNTER // HACKABOT 2026")
         self.screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
@@ -397,6 +405,16 @@ class FPSGame:
         self.npcs: list[NPC] = []
         self._active_url = ""
 
+        # Kill feed
+        self.kill_feed: list = []   # list of [timestamp, message]
+
+        # ── Procedural sound effects (numpy-generated, no external files) ──
+        self._init_sounds()
+
+        # ── Pre-generated visual overlays ──
+        self._vignette  = self._make_vignette()
+        self._scanlines = self._make_scanlines()
+
         # Detection worker (runs in background thread)
         self._det_worker = None
         if ENABLE_DETECTION:
@@ -419,6 +437,161 @@ class FPSGame:
         self._capture        = CameraCapture(raw_cap)
         self._last_surface   = None   # last successfully rendered pygame surface
         self._reconnect_after = 0.0   # epoch time before which reconnects are suppressed
+
+    # ── procedural sound generation ──────────────────────────
+
+    @staticmethod
+    def _make_sound_array(samples: np.ndarray) -> pygame.mixer.Sound:
+        """Convert a mono float32 array (-1..1) to a stereo int16 pygame Sound."""
+        clipped = np.clip(samples, -1.0, 1.0)
+        mono    = (clipped * 32767).astype(np.int16)
+        stereo  = np.column_stack([mono, mono])
+        return pygame.sndarray.make_sound(stereo)
+
+    @staticmethod
+    def _load_wav(path: str, trim_s: float = None) -> pygame.mixer.Sound:
+        """Load a WAV file (any bit-depth, any sample rate) as a pygame Sound.
+        Trims to trim_s seconds if given. Resamples to 44100 Hz if needed."""
+        import wave as _wave
+        from math import gcd
+        from scipy.signal import resample_poly
+
+        with _wave.open(path) as f:
+            sr  = f.getframerate()
+            nch = f.getnchannels()
+            sw  = f.getsampwidth()
+            raw = f.readframes(f.getnframes())
+
+        # Decode to float32 (handles 8, 16, 24, 32-bit)
+        data = np.frombuffer(raw, dtype=np.uint8)
+        n_samp = len(data) // sw
+        arr = np.zeros(n_samp, dtype=np.int32)
+        for i in range(sw):
+            arr += data[i::sw].astype(np.int32) << (8 * i)
+        bits = sw * 8
+        arr[arr >= 2 ** (bits - 1)] -= 2 ** bits          # sign-extend
+        audio = arr.astype(np.float32) / (2 ** (bits - 1))
+        audio = audio.reshape(-1, nch)
+
+        if trim_s is not None:
+            audio = audio[:int(sr * trim_s)]
+
+        if sr != 44100:
+            g = gcd(44100, sr)
+            audio = resample_poly(audio, 44100 // g, sr // g, axis=0)
+
+        if nch == 1:
+            audio = np.column_stack([audio, audio])
+
+        s16 = (np.clip(audio, -1, 1) * 32767).astype(np.int16)
+        return pygame.sndarray.make_sound(np.ascontiguousarray(s16))
+
+    def _init_sounds(self):
+        SR = 44100  # sample rate
+
+        # ── snd_shoot: real revolver WAV, trimmed to first shot (~0.25 s) ──
+        try:
+            self.snd_shoot = self._load_wav("revolver_shot.wav", trim_s=0.25)
+        except Exception as e:
+            print(f"[!] revolver_shot.wav failed ({e}) — using fallback")
+            self.snd_shoot = None
+
+        # ── snd_shoot_hit: same gun sound + short metallic ping on top ──
+        # The ping plays simultaneously via a separate channel so you hear
+        # a clear "hit confirmed" cue on top of the real gunshot.
+        try:
+            tink_len = int(SR * 0.07)
+            t_tk     = np.linspace(0, 1, tink_len)
+            tink     = (np.sin(2*np.pi*900  * t_tk) * 0.6 +
+                        np.sin(2*np.pi*1400 * t_tk) * 0.35) * np.exp(-t_tk * 30)
+            self.snd_hit_tink = self._make_sound_array(tink * 0.85)
+        except Exception as e:
+            print(f"[!] snd_hit_tink generation failed: {e}")
+            self.snd_hit_tink = None
+
+        # ── snd_reload: real revolver reload WAV ──
+        try:
+            self.snd_reload = self._load_wav("revolver_reload.wav")
+        except Exception as e:
+            print(f"[!] snd_reload generation failed: {e}")
+            self.snd_reload = None
+
+        # ── snd_hit: high metallic ping ──
+        try:
+            dur     = int(SR * 0.35)
+            t       = np.linspace(0, 1, dur)
+            freq    = 1800.0
+            data    = np.sin(2 * np.pi * freq * t) * np.exp(-t * 9) * 0.7
+            # add a slight harmonic
+            data   += np.sin(2 * np.pi * freq * 2.5 * t) * np.exp(-t * 14) * 0.3
+            self.snd_hit = self._make_sound_array(data)
+        except Exception as e:
+            print(f"[!] snd_hit generation failed: {e}")
+            self.snd_hit = None
+
+        # ── snd_damage: low thud + noise ──
+        try:
+            thud_len   = int(SR * 0.08)
+            noise_len  = int(SR * 0.05)
+            t_thud     = np.linspace(0, 1, thud_len)
+            thud       = np.sin(2 * np.pi * 55.0 * t_thud) * np.exp(-t_thud * 18) * 0.85
+            noise      = np.random.uniform(-1, 1, noise_len) * np.exp(-np.linspace(0, 1, noise_len) * 10) * 0.5
+            data       = np.concatenate([thud, noise])
+            self.snd_damage = self._make_sound_array(data)
+        except Exception as e:
+            print(f"[!] snd_damage generation failed: {e}")
+            self.snd_damage = None
+
+        # ── snd_empty: dry click (very short) ──
+        try:
+            dur  = int(SR * 0.018)
+            data = np.random.uniform(-1, 1, dur) * np.linspace(1, 0, dur) * 0.6
+            self.snd_empty = self._make_sound_array(data)
+        except Exception as e:
+            print(f"[!] snd_empty generation failed: {e}")
+            self.snd_empty = None
+
+        # Apply master volume to all sounds
+        for snd in (self.snd_shoot, self.snd_hit_tink, self.snd_reload,
+                    self.snd_hit, self.snd_damage, self.snd_empty):
+            if snd is not None:
+                snd.set_volume(SOUND_VOLUME)
+
+    def _play(self, snd):
+        """Play a pygame Sound, silently ignoring any errors."""
+        try:
+            if snd is not None:
+                snd.play()
+        except Exception:
+            pass
+
+    # ── pre-generated visual overlays ────────────────────────
+
+    @staticmethod
+    def _make_vignette() -> pygame.Surface:
+        """Dark-edge vignette, pre-rendered once."""
+        surf = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+        surf.fill((0, 0, 0, 0))
+        iterations = 50
+        for i in range(iterations):
+            # i=0 → outermost ring (max alpha), i=49 → innermost (alpha 0)
+            alpha = int(160 * (1.0 - i / iterations))
+            margin = i * min(WINDOW_W, WINDOW_H) // (2 * iterations)
+            rect = pygame.Rect(margin, margin,
+                               WINDOW_W - 2 * margin, WINDOW_H - 2 * margin)
+            ring = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+            pygame.draw.rect(ring, (0, 0, 0, alpha), rect, max(1, min(WINDOW_W, WINDOW_H) // (2 * iterations) + 1))
+            surf.blit(ring, (0, 0))
+        return surf
+
+    @staticmethod
+    def _make_scanlines() -> pygame.Surface:
+        """Subtle horizontal scanlines, pre-rendered once."""
+        surf = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+        surf.fill((0, 0, 0, 0))
+        for y in range(0, WINDOW_H, 3):
+            pygame.draw.line(surf, (0, 0, 0, 18), (0, y), (WINDOW_W - 1, y), 1)
+        return surf
 
     # ── serial ───────────────────────────────────────────────
 
@@ -533,9 +706,9 @@ class FPSGame:
     # ── NPC tracking ─────────────────────────────────────────
 
     def _update_npc_tracking(self, new_boxes: list):
-        """Match incoming detection boxes to existing NPC objects by center proximity."""
-        NPC_TIMEOUT = 1.0   # drop NPC if not seen for this many seconds
-        MATCH_DIST  = 130   # max pixel distance to consider same person
+        """Match incoming detection boxes to existing NPC objects."""
+        NPC_TIMEOUT = 0.4   # drop NPC if not seen for this many seconds (short = no ghost duplicates)
+        MATCH_DIST  = 250   # max pixel distance for centre-based fallback match
         KILL_LINGER = 0.8   # seconds to show kill flash before removing NPC
 
         now = time.time()
@@ -547,45 +720,52 @@ class FPSGame:
         self.npcs = [n for n in self.npcs
                      if n.health <= 0 or (now - n.last_seen) < NPC_TIMEOUT]
 
-        # Match new boxes to existing NPCs
+        def iou(a, b):
+            ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+            ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+            inter = max(0, ix2-ix1) * max(0, iy2-iy1)
+            ua = (a[2]-a[0])*(a[3]-a[1])
+            ub = (b[2]-b[0])*(b[3]-b[1])
+            return inter / (ua + ub - inter) if (ua + ub - inter) > 0 else 0
+
+        # Match new boxes to existing NPCs —
+        # prefer IoU overlap (handles large position jumps when camera/person moves),
+        # fall back to centre distance for nearby non-overlapping boxes.
         matched = set()
         for (x1, y1, x2, y2) in new_boxes:
             cx = (x1 + x2) // 2
             cy = (y1 + y2) // 2
+            new_box = (x1, y1, x2, y2)
 
-            best_idx  = None
-            best_dist = MATCH_DIST
+            best_idx   = None
+            best_score = -1   # higher = better match
             for i, npc in enumerate(self.npcs):
                 if i in matched or npc.health <= 0:
                     continue
-                nx1, ny1, nx2, ny2 = npc.box
-                d = math.hypot(cx - (nx1+nx2)//2, cy - (ny1+ny2)//2)
-                if d < best_dist:
-                    best_dist = d
-                    best_idx  = i
+                nbox = tuple(int(v) for v in npc.display_box)
+                overlap = iou(new_box, nbox)
+                if overlap > 0:
+                    # Any overlap counts as a match; prefer highest IoU
+                    if overlap > best_score:
+                        best_score = overlap
+                        best_idx   = i
+                else:
+                    # No overlap — use centre distance as fallback
+                    nx1, ny1, nx2, ny2 = npc.box
+                    d = math.hypot(cx - (nx1+nx2)//2, cy - (ny1+ny2)//2)
+                    score = 1.0 - d / MATCH_DIST   # 0..1, higher = closer
+                    if d < MATCH_DIST and score > best_score:
+                        best_score = score
+                        best_idx   = i
 
             if best_idx is not None:
                 self.npcs[best_idx].box       = (x1, y1, x2, y2)
                 self.npcs[best_idx].last_seen = now
                 matched.add(best_idx)
             else:
-                # Only spawn a new NPC if this box doesn't heavily overlap
-                # an existing one (guards against YOLO returning two boxes
-                # for the same person and producing duplicate health bars)
-                def iou(a, b):
-                    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
-                    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
-                    inter = max(0, ix2-ix1) * max(0, iy2-iy1)
-                    ua = (a[2]-a[0])*(a[3]-a[1])
-                    ub = (b[2]-b[0])*(b[3]-b[1])
-                    return inter / (ua + ub - inter) if (ua + ub - inter) > 0 else 0
-
-                new_box = (x1, y1, x2, y2)
-                overlaps = any(
-                    iou(new_box, tuple(int(v) for v in n.display_box)) > 0.3
-                    for n in self.npcs
-                )
-                if not overlaps and len(self.npcs) < 8:
+                # Only spawn a new NPC if no existing NPC overlaps this box
+                if not any(iou(new_box, tuple(int(v) for v in n.display_box)) > 0.1
+                           for n in self.npcs) and len(self.npcs) < 8:
                     self.npcs.append(NPC(x1, y1, x2, y2))
 
     @staticmethod
@@ -614,7 +794,10 @@ class FPSGame:
 
     def shoot(self):
         now = time.time()
-        if self.reloading or self.ammo <= 0:
+        if self.reloading:
+            return
+        if self.ammo <= 0:
+            self._play(self.snd_empty)
             return
         if now - self.last_shoot < self.shoot_cooldown:
             return
@@ -623,11 +806,12 @@ class FPSGame:
         self.ammo      -= 1
         self.shoot_flash = 0.08
         self.crosshair_spread = min(self.crosshair_spread + 12, 40)
-
         # Check if crosshair is on a live NPC
         targeted = self._get_targeted_npc()
         if targeted:
-            # ── Confirmed NPC hit ──
+            # ── Confirmed NPC hit — real gunshot + impact tink overlay ──
+            self._play(self.snd_shoot)
+            self._play(self.snd_hit_tink)
             damage = 25
             targeted.health    = max(0, targeted.health - damage)
             targeted.hit_flash = 0.25
@@ -639,8 +823,11 @@ class FPSGame:
                 targeted.kill_time = time.time()
                 self.kills += 1
                 self.score += 150   # kill bonus
+                self._play(self.snd_hit)
+                self.kill_feed.append([time.time(), "HOSTILE ELIMINATED"])
         else:
-            # ── Miss ──
+            # ── Miss — standard gunshot only ──
+            self._play(self.snd_shoot)
             self.hit_markers.append(
                 HitMarker(int(self.ch_x), int(self.ch_y), confirmed=False))
             # No score for a miss (encourage aiming)
@@ -652,10 +839,12 @@ class FPSGame:
         if not self.reloading and self.ammo < self.max_ammo:
             self.reloading    = True
             self.reload_start = time.time()
+            self._play(self.snd_reload)
 
     def take_damage(self, amount=15):
         self.health      = max(0, self.health - amount)
         self.damage_flash = 0.3
+        self._play(self.snd_damage)
         if self.health == 0:
             self.game_active = False
 
@@ -705,6 +894,9 @@ class FPSGame:
                 dx2 + (tx2 - dx2) * lerp,
                 dy2 + (ty2 - dy2) * lerp,
             )
+            # Smooth display_health toward real health at 80 HP/s (visibly drains)
+            npc.display_health = max(float(npc.health),
+                                     npc.display_health - 80.0 * dt)
 
         # Pull latest detections from background worker
         if self._det_worker is not None:
@@ -771,6 +963,17 @@ class FPSGame:
         if self._det_worker is not None:
             self._det_worker.submit(frame)
 
+        # ── cinematic color grade ──────────────────────────────────────────
+        # Boost contrast, slight desaturation, cool blue tint — makes the
+        # raw camera feed look like a game render rather than plain video.
+        frame = cv2.convertScaleAbs(frame, alpha=1.25, beta=-18)   # contrast + lift
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV).astype(np.float32)
+        hsv[:, :, 1] *= 0.72          # desaturate to ~72 % of original
+        hsv[:, :, 1] = np.clip(hsv[:, :, 1], 0, 255)
+        frame = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+        frame[:, :, 0] = np.clip(frame[:, :, 0].astype(np.int16) + 12, 0, 255)  # blue +12
+        frame[:, :, 2] = np.clip(frame[:, :, 2].astype(np.int16) - 8,  0, 255)  # red  -8
+
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frame = np.rot90(frame)
         surface = pygame.surfarray.make_surface(frame)
@@ -824,36 +1027,37 @@ class FPSGame:
                 (cx+size, cy+size), (cx+size//2, cy+size//2), thick)
 
     def draw_npc_overlays(self):
-        """Draw bounding boxes, NPC health bars, and targeting indicators."""
-        now = time.time()
-        cx, cy = int(self.ch_x), int(self.ch_y)
-
+        """Draw a slim health bar above each detected target. No brackets or labels."""
+        targeted = self._get_targeted_npc()
         for npc in self.npcs:
-            # Use smoothed display_box (floats → ints) then shrink it
-            raw = tuple(int(v) for v in npc.display_box)
-            x1, y1, x2, y2 = self._shrink_box(raw, HIT_SHRINK_X, HIT_SHRINK_Y)
-            w = x2 - x1
-            h = y2 - y1
-            if w <= 0 or h <= 0:
-                continue
-
-            # Skip dead NPCs (no flash needed — crosshair kill is instant feedback)
             if npc.health <= 0:
                 continue
 
-            # ── health bar only — drawn above the detected person ──
-            bar_h   = 8
-            bar_y   = max(y1 - 14, 0)
-            pct     = npc.health / npc.MAX_HEALTH
-            bar_col = (GREEN if pct > 0.5 else ORANGE if pct > 0.25 else RED)
+            x1, y1, x2, _  = (int(v) for v in npc.display_box)
+            w = x2 - x1
+            if w <= 0:
+                continue
 
-            pygame.draw.rect(self.screen, (20, 20, 20), (x1,   bar_y,   w,          bar_h))
-            pygame.draw.rect(self.screen, bar_col,      (x1,   bar_y,   int(w*pct), bar_h))
-            pygame.draw.rect(self.screen, (80, 80, 80), (x1-1, bar_y-1, w+2,        bar_h+2), 1)
+            pct     = npc.display_health / npc.MAX_HEALTH
+            bar_h   = 5
+            bar_y   = y1 - bar_h - 4
 
-            # HP number — small, unobtrusive
-            label = self.font_small.render(f"{npc.health}", True, bar_col)
-            self.screen.blit(label, (x1, bar_y - 16))
+            # Bar colour: red when crosshair is on this target, else green→orange→red by HP
+            if npc is targeted:
+                bar_col = (220, 30, 30)
+            elif npc.hit_flash > 0:
+                bar_col = (255, 255, 255)
+            elif pct > 0.5:
+                bar_col = (0, 210, 80)
+            elif pct > 0.25:
+                bar_col = (255, 140, 0)
+            else:
+                bar_col = (220, 30, 30)
+
+            # Dark background track
+            pygame.draw.rect(self.screen, (15, 15, 15, 180), (x1, bar_y, w, bar_h))
+            # Filled portion
+            pygame.draw.rect(self.screen, bar_col, (x1, bar_y, max(1, int(w * pct)), bar_h))
 
     def draw_health_bar(self):
         x, y = 40, WINDOW_H - 80
@@ -908,6 +1112,24 @@ class FPSGame:
 
         kills_txt = self.font_small.render(f"KILLS: {self.kills}", True, HUD_DIM)
         self.screen.blit(kills_txt, kills_txt.get_rect(centerx=x).move(0, 60))
+
+    def draw_kill_feed(self):
+        """Draw the last 4 kills on the right side, fading over 4 seconds."""
+        FADE_TIME = 4.0
+        now = time.time()
+        # Prune old entries
+        self.kill_feed = [e for e in self.kill_feed if now - e[0] < FADE_TIME]
+        recent = self.kill_feed[-4:]   # show at most 4
+        x = WINDOW_W - 260
+        y = 90
+        for entry in reversed(recent):
+            age   = now - entry[0]
+            frac  = max(0.0, 1.0 - age / FADE_TIME)
+            green = int(200 * frac)
+            col   = (0, green, int(60 * frac))
+            txt   = self.font_med.render(entry[1], True, col)
+            self.screen.blit(txt, (x, y))
+            y += txt.get_height() + 4
 
     def draw_fps(self):
         txt = self.font_small.render(f"FPS {self.fps_display}", True, (80, 80, 80))
@@ -1051,22 +1273,26 @@ class FPSGame:
             # 3. Shoot flash (muzzle effect, before HUD)
             self.draw_shoot_flash()
 
-            # 4. HUD
+            # 4. Vignette + scanlines (atmospheric, under HUD text)
+            self.screen.blit(self._vignette, (0, 0))
+            self.screen.blit(self._scanlines, (0, 0))
+
+            # 5. HUD
             self.draw_corner_brackets()
             self.draw_hud_title()
             self.draw_crosshair()
             self.draw_hit_markers()
-            self.draw_health_bar()
             self.draw_ammo()
             self.draw_score()
+            self.draw_kill_feed()
             self.draw_fps()
             self.draw_reload_hint()
             self.draw_serial_status()
 
-            # 5. Damage flash (on top of everything)
+            # 6. Damage flash (on top of everything)
             self.draw_damage_flash()
 
-            # 6. Game over screen
+            # 7. Game over screen
             if not self.game_active:
                 self.draw_game_over()
 
