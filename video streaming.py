@@ -147,7 +147,7 @@ MUSIC_VOLUME  = 0.4   # background music volume (separate from SFX)
 #    JOY:x,y        — joystick values  -100 to +100, e.g. JOY:0,75
 #                     forwarded to robot via nRF24 for movement
 #
-ENABLE_SERIAL = False     # set False to use mouse aim instead
+ENABLE_SERIAL = True      # set False to use mouse aim instead
 SERIAL_PORT   = "AUTO"    # "AUTO" = find Pico automatically, or set e.g. "COM4"
 SERIAL_BAUD   = 115200
 
