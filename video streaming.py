@@ -60,7 +60,7 @@ PHONE_IP = "10.209.213.245"  # ← SET THIS to your phone's IP address
 
 # True  = use laptop webcam (good for testing)
 # False = connect to phone stream (set PHONE_IP first)
-USE_WEBCAM_FALLBACK = True
+USE_WEBCAM_FALLBACK = False
 
 # All URLs tried in order when USE_WEBCAM_FALLBACK = False.
 # The script auto-detects which one works — no need to pick manually.
@@ -84,6 +84,11 @@ STREAM_CONNECT_TIMEOUT = 4
 
 WINDOW_W = 1280
 WINDOW_H = 720
+
+# True  = launch in fullscreen (resolution auto-detected)
+# False = windowed 1280×720
+# F11   = toggle at any time while the game is running
+FULLSCREEN = True
 
 # ─── DETECTION CONFIG ─────────────────────────────────────────
 #
@@ -111,9 +116,12 @@ BOX_SMOOTH_SPEED  = 4.0
 
 # ─── SOUND CONFIG ─────────────────────────────────────────────
 #
-#  SOUND_VOLUME : master volume for all sound effects (0.0 = silent, 1.0 = full)
+#  SOUND_VOLUME  : volume for gunshot / hit / damage sounds  (0.0 – 1.0)
+#  RELOAD_VOLUME : volume for the reload sound               (0.0 – 1.0)
+#                  Set this higher than SOUND_VOLUME if the reload feels too quiet.
 #
-SOUND_VOLUME = 0.8
+SOUND_VOLUME  = 0.8
+RELOAD_VOLUME = 1.0   # ← raise this if reload is still too soft
 
 # ─── SERIAL (Pico 1 USB) CONFIG ───────────────────────────────
 #
@@ -365,10 +373,18 @@ class HitMarker:
 
 class FPSGame:
     def __init__(self):
+        global WINDOW_W, WINDOW_H
         pygame.mixer.pre_init(frequency=44100, size=-16, channels=2, buffer=512)
         pygame.init()
         pygame.display.set_caption("ROBO-HUNTER // HACKABOT 2026")
-        self.screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
+        if FULLSCREEN:
+            info = pygame.display.Info()
+            WINDOW_W = info.current_w
+            WINDOW_H = info.current_h
+            self.screen = pygame.display.set_mode(
+                (WINDOW_W, WINDOW_H), pygame.FULLSCREEN)
+        else:
+            self.screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
         self.clock  = pygame.time.Clock()
 
         # Fonts
@@ -395,6 +411,19 @@ class FPSGame:
         self.fps_display    = 0
         self.frame_times    = []
         self.crosshair_spread = 0
+
+        # Gun animation state (used for shake/flash even without gun model)
+        self.gun_recoil   = 0.0
+        self.gun_bob      = 0.0
+        self.gun_reload_y = 0.0
+        self.shake_x      = 0.0
+        self.shake_y      = 0.0
+        self.shake_time   = 0.0
+
+        # Volume slider
+        self._current_volume = SOUND_VOLUME
+        self._vol_display_until = 0.0
+        self._vol_dragging   = False
 
         # Moveable crosshair — driven by IMU when serial is connected,
         # otherwise stays at screen centre (fully playable with keyboard/mouse)
@@ -551,11 +580,26 @@ class FPSGame:
             print(f"[!] snd_empty generation failed: {e}")
             self.snd_empty = None
 
-        # Apply master volume to all sounds
-        for snd in (self.snd_shoot, self.snd_hit_tink, self.snd_reload,
+        # Apply volumes — reload gets its own setting (often needs to be louder)
+        for snd in (self.snd_shoot, self.snd_hit_tink,
                     self.snd_hit, self.snd_damage, self.snd_empty):
             if snd is not None:
                 snd.set_volume(SOUND_VOLUME)
+        if self.snd_reload is not None:
+            self.snd_reload.set_volume(RELOAD_VOLUME)
+
+    def _set_volume(self, vol: float):
+        """Set master volume for all sounds and show the HUD indicator."""
+        self._current_volume = round(vol, 1)
+        for snd in (self.snd_shoot, self.snd_hit_tink,
+                    self.snd_hit, self.snd_damage, self.snd_empty):
+            if snd is not None:
+                snd.set_volume(self._current_volume)
+        # Reload gets the same scaling relative to its original RELOAD_VOLUME ratio
+        if self.snd_reload is not None:
+            ratio = RELOAD_VOLUME / max(SOUND_VOLUME, 0.01)
+            self.snd_reload.set_volume(min(1.0, self._current_volume * ratio))
+        self._vol_display_until = time.time() + 2.0
 
     def _play(self, snd):
         """Play a pygame Sound, silently ignoring any errors."""
@@ -806,6 +850,10 @@ class FPSGame:
         self.ammo      -= 1
         self.shoot_flash = 0.08
         self.crosshair_spread = min(self.crosshair_spread + 12, 40)
+        self.gun_recoil = 1.0
+        self.shake_x    = random.uniform(-6, 6)
+        self.shake_y    = random.uniform(-14, -6)
+        self.shake_time = 0.10
         # Check if crosshair is on a live NPC
         targeted = self._get_targeted_npc()
         if targeted:
@@ -839,6 +887,7 @@ class FPSGame:
         if not self.reloading and self.ammo < self.max_ammo:
             self.reloading    = True
             self.reload_start = time.time()
+            self.gun_reload_y = 0.0
             self._play(self.snd_reload)
 
     def take_damage(self, amount=15):
@@ -867,6 +916,32 @@ class FPSGame:
         # Flash timers
         self.damage_flash = max(0, self.damage_flash - dt)
         self.shoot_flash  = max(0, self.shoot_flash  - dt)
+
+        # Screen shake
+        if self.shake_time > 0:
+            self.shake_time = max(0.0, self.shake_time - dt)
+            frac = self.shake_time / 0.10
+            self.shake_x = random.uniform(-6, 6) * frac
+            self.shake_y = random.uniform(-14, -6) * frac
+        else:
+            self.shake_x = 0.0
+            self.shake_y = 0.0
+
+        # Gun recoil springs back
+        self.gun_recoil = max(0.0, self.gun_recoil - dt * 9.0)
+
+        # Idle gun bob
+        self.gun_bob += dt * 1.8
+
+        # Gun reload drop / return
+        if self.reloading:
+            progress = (time.time() - self.reload_start) / self.reload_time
+            if progress < 0.35:
+                self.gun_reload_y = progress / 0.35          # drop down
+            else:
+                self.gun_reload_y = max(0.0, 1.0 - (progress - 0.35) / 0.65)  # come back
+        else:
+            self.gun_reload_y = 0.0
 
         # Reload
         if self.reloading:
@@ -1060,50 +1135,125 @@ class FPSGame:
             pygame.draw.rect(self.screen, bar_col, (x1, bar_y, max(1, int(w * pct)), bar_h))
 
     def draw_health_bar(self):
-        x, y = 40, WINDOW_H - 80
-        w, h = 220, 18
-        pct  = self.health / 100
+        """Valorant-style: large colour-coded HP number + thin bar."""
+        x, y = 40, WINDOW_H - 70
+        pct = self.health / 100
+        col = (100, 220, 100) if pct > 0.5 else ORANGE if pct > 0.25 else (220, 50, 50)
 
-        pygame.draw.rect(self.screen, (30, 30, 30), (x-2, y-2, w+4, h+4))
-        pygame.draw.rect(self.screen, (60, 60, 60), (x, y, w, h))
+        # Large HP number
+        big = self.font_big.render(str(self.health), True, col)
+        self.screen.blit(big, (x, y - big.get_height()))
 
-        col = GREEN if pct > 0.5 else ORANGE if pct > 0.25 else RED
-        pygame.draw.rect(self.screen, col, (x, y, int(w * pct), h))
-        pygame.draw.rect(self.screen, HUD_GREEN, (x-2, y-2, w+4, h+4), 1)
+        # Thin bar below
+        bw, bh = 180, 4
+        by = y + 4
+        pygame.draw.rect(self.screen, (40, 40, 40), (x, by, bw, bh))
+        pygame.draw.rect(self.screen, col, (x, by, max(0, int(bw * pct)), bh))
 
-        label = self.font_small.render(f"HEALTH  {self.health}%", True, HUD_GREEN)
-        self.screen.blit(label, (x, y - 20))
-        icon = self.font_med.render("♥", True, col)
-        self.screen.blit(icon, (x + w + 10, y - 4))
+        # Small label
+        lbl = self.font_small.render("HP", True, (80, 80, 80))
+        self.screen.blit(lbl, (x + big.get_width() + 8, y - lbl.get_height()))
 
     def draw_ammo(self):
-        x, y = WINDOW_W - 200, WINDOW_H - 80
-        label = self.font_small.render("AMMO", True, HUD_DIM)
-        self.screen.blit(label, (x, y - 20))
-
+        """CS:GO-style: large ammo number / reserve + reload bar."""
         if self.reloading:
-            progress = (time.time() - self.reload_start) / self.reload_time
-            w, h = 160, 10
-            pygame.draw.rect(self.screen, (30, 30, 30), (x, y + 8, w, h))
-            pygame.draw.rect(self.screen, ORANGE, (x, y + 8, int(w * progress), h))
-            pygame.draw.rect(self.screen, HUD_GREEN, (x, y + 8, w, h), 1)
-            txt = self.font_med.render("RELOADING...", True, ORANGE)
-            self.screen.blit(txt, (x, y - 4))
+            progress = min(1.0, (time.time() - self.reload_start) / self.reload_time)
+            # RELOADING label
+            txt = self.font_med.render("RELOADING", True, ORANGE)
+            rx = WINDOW_W - txt.get_width() - 40
+            ry = WINDOW_H - 100
+            self.screen.blit(txt, (rx, ry))
+            # Progress bar
+            bw, bh = txt.get_width(), 4
+            by = ry + txt.get_height() + 4
+            pygame.draw.rect(self.screen, (40, 40, 40), (rx, by, bw, bh))
+            pygame.draw.rect(self.screen, ORANGE, (rx, by, int(bw * progress), bh))
         else:
-            pip_w, pip_h = 8, 16
-            gap = 4
-            for i in range(self.max_ammo):
-                col = HUD_GREEN if i < self.ammo else (40, 40, 40)
-                bx  = x + i * (pip_w + gap)
-                if i >= 15:
-                    bx = x + (i - 15) * (pip_w + gap)
-                    by = y + pip_h + 4
-                else:
-                    by = y
-                pygame.draw.rect(self.screen, col, (bx, by, pip_w, pip_h))
+            # Large "6 / 30" counter bottom-right
+            col_cur = WHITE if self.ammo > self.max_ammo // 3 else (220, 80, 80)
+            cur_txt = self.font_big.render(str(self.ammo), True, col_cur)
+            sep_txt = self.font_hud.render(" /", True, (80, 80, 80))
+            res_txt = self.font_hud.render(f" {self.max_ammo}", True, (80, 80, 80))
 
-            count = self.font_hud.render(f"{self.ammo:02d}/{self.max_ammo}", True, HUD_GREEN)
-            self.screen.blit(count, (x, y - 4))
+            total_w = cur_txt.get_width() + sep_txt.get_width() + res_txt.get_width()
+            rx = WINDOW_W - total_w - 40
+            ry = WINDOW_H - cur_txt.get_height() - 20
+
+            self.screen.blit(cur_txt, (rx, ry))
+            self.screen.blit(sep_txt, (rx + cur_txt.get_width(), ry + cur_txt.get_height() - sep_txt.get_height()))
+            self.screen.blit(res_txt, (rx + cur_txt.get_width() + sep_txt.get_width(), ry + cur_txt.get_height() - res_txt.get_height()))
+
+            lbl = self.font_small.render("AMMO", True, (60, 60, 60))
+            self.screen.blit(lbl, (WINDOW_W - lbl.get_width() - 40, ry - lbl.get_height() - 2))
+
+    def draw_muzzle_flash(self):
+        """Orange/white burst near crosshair when firing."""
+        if self.shoot_flash <= 0.04:
+            return
+        frac = self.shoot_flash / 0.08
+        tip_x = int(self.ch_x) + int(self.gun_recoil * -10)
+        tip_y = int(self.ch_y) + int(self.gun_recoil * -10)
+
+        size = 120
+        surf = pygame.Surface((size, size), pygame.SRCALPHA)
+        cx, cy = size // 2, size // 2
+        r = int(28 * frac)
+        pygame.draw.circle(surf, (255, 255, 220, int(220 * frac)), (cx, cy), r)
+        pygame.draw.circle(surf, (255, 145, 20,  int(180 * frac)), (cx, cy), int(r * 1.6))
+        for i in range(8):
+            a = math.radians(i * 45)
+            ex = cx + int(math.cos(a) * int(52 * frac))
+            ey = cy + int(math.sin(a) * int(52 * frac))
+            pygame.draw.line(surf, (255, 185, 40, int(130 * frac)), (cx, cy), (ex, ey), 2)
+        self.screen.blit(surf, (tip_x - cx, tip_y - cy))
+
+    def draw_volume_slider(self):
+        """Always-visible volume slider in the top-right corner."""
+        sx, sy = WINDOW_W - 210, 12   # track left edge, vertical centre
+        sw, sh = 160, 6               # track width, height
+        vol = self._current_volume
+        knob_x = sx + int(sw * vol)
+
+        # "VOL" label
+        lbl = self.font_small.render("VOL", True, HUD_DIM)
+        self.screen.blit(lbl, (sx - lbl.get_width() - 8, sy - lbl.get_height() // 2))
+
+        # Track background
+        pygame.draw.rect(self.screen, (35, 35, 35), (sx, sy - sh // 2, sw, sh), border_radius=3)
+        # Filled portion
+        if int(sw * vol) > 0:
+            pygame.draw.rect(self.screen, HUD_GREEN,
+                (sx, sy - sh // 2, int(sw * vol), sh), border_radius=3)
+        # Track outline
+        pygame.draw.rect(self.screen, (60, 60, 60), (sx, sy - sh // 2, sw, sh), 1, border_radius=3)
+
+        # Knob circle
+        knob_col = WHITE if self._vol_dragging else (200, 200, 200)
+        pygame.draw.circle(self.screen, knob_col, (knob_x, sy), 8)
+        pygame.draw.circle(self.screen, (30, 30, 30), (knob_x, sy), 8, 1)
+
+        # Percentage label
+        pct = self.font_small.render(f"{int(vol * 100)}%", True, HUD_DIM)
+        self.screen.blit(pct, (sx + sw + 6, sy - pct.get_height() // 2))
+
+    def _toggle_fullscreen(self):
+        global WINDOW_W, WINDOW_H
+        flags = self.screen.get_flags()
+        if flags & pygame.FULLSCREEN:
+            WINDOW_W, WINDOW_H = 1280, 720
+            self.screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
+        else:
+            info = pygame.display.Info()
+            WINDOW_W = info.current_w
+            WINDOW_H = info.current_h
+            self.screen = pygame.display.set_mode(
+                (WINDOW_W, WINDOW_H), pygame.FULLSCREEN)
+        # Regenerate resolution-dependent overlays
+        self._vignette  = self._make_vignette()
+        self._scanlines = self._make_scanlines()
+        # Re-centre crosshair
+        self.ch_x = float(WINDOW_W // 2)
+        self.ch_y = float(WINDOW_H // 2)
 
     def draw_score(self):
         x = WINDOW_W // 2
@@ -1133,7 +1283,7 @@ class FPSGame:
 
     def draw_fps(self):
         txt = self.font_small.render(f"FPS {self.fps_display}", True, (80, 80, 80))
-        self.screen.blit(txt, (WINDOW_W - 80, 10))
+        self.screen.blit(txt, (WINDOW_W - 80, 28))
 
     def draw_corner_brackets(self):
         col    = HUD_GREEN
@@ -1244,55 +1394,85 @@ class FPSGame:
                         self.shoot()
                     if event.key == pygame.K_d and self.game_active:
                         self.take_damage()
+                    if event.key == pygame.K_LEFTBRACKET:
+                        self._set_volume(max(0.0, self._current_volume - 0.1))
+                    if event.key == pygame.K_RIGHTBRACKET:
+                        self._set_volume(min(1.0, self._current_volume + 0.1))
+                    if event.key == pygame.K_F11:
+                        self._toggle_fullscreen()
 
                 # Mouse moves crosshair when gun serial is not connected (testing)
-                if event.type == pygame.MOUSEMOTION and not ENABLE_SERIAL:
-                    self.ch_x = float(event.pos[0])
-                    self.ch_y = float(event.pos[1])
+                if event.type == pygame.MOUSEMOTION:
+                    if not ENABLE_SERIAL:
+                        self.ch_x = float(event.pos[0])
+                        self.ch_y = float(event.pos[1])
+                    if self._vol_dragging:
+                        sx = WINDOW_W - 210
+                        sw = 160
+                        frac = (event.pos[0] - sx) / sw
+                        self._set_volume(max(0.0, min(1.0, frac)))
+
+                if event.type == pygame.MOUSEBUTTONUP:
+                    if event.button == 1:
+                        self._vol_dragging = False
 
                 if event.type == pygame.MOUSEBUTTONDOWN:
-                    if event.button == 1 and self.game_active:
-                        self.shoot()
+                    if event.button == 1:
+                        # Check volume slider hit
+                        sx, sy, sw, sh = WINDOW_W - 210, 12, 160, 14
+                        if (sx <= event.pos[0] <= sx + sw and
+                                sy - 10 <= event.pos[1] <= sy + sh + 10):
+                            self._vol_dragging = True
+                            frac = (event.pos[0] - sx) / sw
+                            self._set_volume(max(0.0, min(1.0, frac)))
+                        elif self.game_active:
+                            self.shoot()
 
             # ── UPDATE ──────────────────────────────────────
             self.update(dt)
 
             # ── DRAW ────────────────────────────────────────
-            # 1. Video frame
+            # 1. Video frame (with screen shake offset)
+            self.screen.fill((0, 0, 0))
             frame = self.get_frame()
+            sx, sy = int(self.shake_x), int(self.shake_y)
             if frame:
-                self.screen.blit(frame, (0, 0))
+                self.screen.blit(frame, (sx, sy))
             else:
-                self.screen.fill((10, 10, 10))
                 err = self.font_med.render("NO VIDEO SIGNAL", True, RED)
                 self.screen.blit(err, err.get_rect(center=(WINDOW_W//2, WINDOW_H//2)))
 
-            # 2. NPC detection overlays (below HUD, above raw video)
+            # 2. NPC detection overlays
             self.draw_npc_overlays()
 
-            # 3. Shoot flash (muzzle effect, before HUD)
+            # 3. Shoot flash (screen-wide muzzle brightness)
             self.draw_shoot_flash()
 
-            # 4. Vignette + scanlines (atmospheric, under HUD text)
+            # 4. Vignette + scanlines
             self.screen.blit(self._vignette, (0, 0))
             self.screen.blit(self._scanlines, (0, 0))
 
-            # 5. HUD
+            # 5. Muzzle flash (at crosshair, no gun model)
+            self.draw_muzzle_flash()
+
+            # 6. HUD
             self.draw_corner_brackets()
             self.draw_hud_title()
             self.draw_crosshair()
             self.draw_hit_markers()
+            self.draw_health_bar()
             self.draw_ammo()
             self.draw_score()
             self.draw_kill_feed()
             self.draw_fps()
             self.draw_reload_hint()
             self.draw_serial_status()
+            self.draw_volume_slider()
 
-            # 6. Damage flash (on top of everything)
+            # 7. Damage flash (on top of everything)
             self.draw_damage_flash()
 
-            # 7. Game over screen
+            # 8. Game over screen
             if not self.game_active:
                 self.draw_game_over()
 
