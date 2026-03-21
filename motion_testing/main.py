@@ -5,7 +5,7 @@
 import json
 from machine import Pin, I2C, ADC
 from time import sleep_ms, ticks_ms, ticks_diff
-from bmi160 import BMI160
+from motion_testing.bmi160 import BMI160
 
 # ============================================================
 # PIN SETUP
