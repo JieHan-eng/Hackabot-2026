@@ -7,6 +7,10 @@ import math
 import random
 import threading
 import queue
+import os
+
+# Absolute path to the project folder — used for sound/music file loading
+_ASSETS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── Optional imports ──────────────────────────────────────────────────────────
 try:
@@ -122,6 +126,7 @@ BOX_SMOOTH_SPEED  = 4.0
 #
 SOUND_VOLUME  = 0.8
 RELOAD_VOLUME = 1.0   # ← raise this if reload is still too soft
+MUSIC_VOLUME  = 0.4   # background music volume (separate from SFX)
 
 # ─── SERIAL (Pico 1 USB) CONFIG ───────────────────────────────
 #
@@ -142,7 +147,7 @@ RELOAD_VOLUME = 1.0   # ← raise this if reload is still too soft
 #    JOY:x,y        — joystick values  -100 to +100, e.g. JOY:0,75
 #                     forwarded to robot via nRF24 for movement
 #
-ENABLE_SERIAL = True      # set False to use mouse aim instead
+ENABLE_SERIAL = False     # set False to use mouse aim instead
 SERIAL_PORT   = "AUTO"    # "AUTO" = find Pico automatically, or set e.g. "COM4"
 SERIAL_BAUD   = 115200
 
@@ -176,6 +181,56 @@ HUD_GREEN   = (0,   255, 140)
 HUD_DIM     = (0,   140, 80)
 CROSSHAIR_C = (255, 255, 255)
 
+# Per-map data: name, subtitle, tags, accent_colour, bg_colour, particle_colour
+MAP_DATA = [
+    {
+        "name":     "ARCTIC STORM",
+        "sub":      "FROZEN TUNDRA  •  BLIZZARD CONDITIONS",
+        "tags":     ["SNOW", "WIND", "ZERO VISIBILITY"],
+        "accent":   (140, 200, 255),
+        "bg":       (8,  18,  35),
+        "particle": (200, 220, 255),
+        "filter":   "arctic",
+    },
+    {
+        "name":     "WARZONE",
+        "sub":      "URBAN RUINS  •  ACTIVE COMBAT ZONE",
+        "tags":     ["FIRE", "SMOKE", "URBAN"],
+        "accent":   (220, 100, 30),
+        "bg":       (25,  8,   5),
+        "particle": (255, 130, 40),
+        "filter":   "warzone",
+    },
+    {
+        "name":     "JUNGLE WARFARE",
+        "sub":      "DENSE CANOPY  •  HIGH HUMIDITY",
+        "tags":     ["RAIN", "FOG", "VEGETATION"],
+        "accent":   (60,  200, 80),
+        "bg":       (5,   18,  8),
+        "particle": (100, 200, 80),
+        "filter":   "jungle",
+    },
+    {
+        "name":     "NIGHT OPS",
+        "sub":      "CLASSIFIED FACILITY  •  LIGHTS OUT",
+        "tags":     ["DARKNESS", "STEALTH", "NV ACTIVE"],
+        "accent":   (40,  220, 130),
+        "bg":       (5,   10,  22),
+        "particle": (60,  180, 100),
+        "filter":   "nightops",
+    },
+    {
+        "name":     "CYBERPUNK CITY",
+        "sub":      "NEON DISTRICT  •  2087",
+        "tags":     ["NEON", "RAIN", "URBAN"],
+        "accent":   (0,   210, 255),
+        "bg":       (8,   3,   25),
+        "particle": (200, 0,   255),
+        "filter":   "cyberpunk",
+    },
+]
+MAP_NAMES = [m["name"] for m in MAP_DATA]
+
 
 # ─── NPC ──────────────────────────────────────────────────────
 
@@ -191,6 +246,7 @@ class NPC:
         self.last_seen      = time.time()
         self.hit_flash      = 0.0   # seconds of hit-flash remaining
         self.kill_time      = None  # set when health → 0
+        self.engaged        = False # True once this NPC has been hit at least once
 
 
 # ─── DETECTION WORKER ─────────────────────────────────────────
@@ -420,6 +476,19 @@ class FPSGame:
         self.frame_times    = []
         self.crosshair_spread = 0
 
+        # ── State machine ──
+        # Start at CONNECTING only when using phone stream; webcam goes straight to TITLE
+        self.state          = "CONNECTING" if not USE_WEBCAM_FALLBACK else "TITLE"
+        self.current_map    = 0
+        self._title_timer   = 0.0
+        self._calib_timer   = 0.0
+        self._calib_delay   = 0.5        # seconds before bar starts filling
+        self._calib_duration = 3.0       # calibration bar fill time
+        self._countdown_val   = 3
+        self._countdown_timer = 0.0
+        self._music_track   = None
+        self._particles: list = []
+
         # Gun animation state (used for shake/flash even without gun model)
         self.gun_recoil   = 0.0
         self.gun_bob      = 0.0
@@ -440,6 +509,7 @@ class FPSGame:
 
         # NPC tracking
         self.npcs: list[NPC] = []
+        self._dead_zones: list = []  # [(x1,y1,x2,y2, expiry_time)] — block respawn in killed region
         self._active_url = ""
 
         # Kill feed
@@ -447,6 +517,8 @@ class FPSGame:
 
         # ── Procedural sound effects (numpy-generated, no external files) ──
         self._init_sounds()
+        # Start menu music immediately on launch
+        self._set_music("menu")
 
         # ── Pre-generated visual overlays ──
         self._vignette  = self._make_vignette()
@@ -492,49 +564,30 @@ class FPSGame:
         return pygame.sndarray.make_sound(stereo)
 
     @staticmethod
-    def _load_wav(path: str, trim_s: float = None) -> pygame.mixer.Sound:
-        """Load a WAV file (any bit-depth, any sample rate) as a pygame Sound.
-        Trims to trim_s seconds if given. Resamples to 44100 Hz if needed."""
-        import wave as _wave
-        from math import gcd
-        from scipy.signal import resample_poly
-
-        with _wave.open(path) as f:
-            sr  = f.getframerate()
-            nch = f.getnchannels()
-            sw  = f.getsampwidth()
-            raw = f.readframes(f.getnframes())
-
-        # Decode to float32 (handles 8, 16, 24, 32-bit)
-        data = np.frombuffer(raw, dtype=np.uint8)
-        n_samp = len(data) // sw
-        arr = np.zeros(n_samp, dtype=np.int32)
-        for i in range(sw):
-            arr += data[i::sw].astype(np.int32) << (8 * i)
-        bits = sw * 8
-        arr[arr >= 2 ** (bits - 1)] -= 2 ** bits          # sign-extend
-        audio = arr.astype(np.float32) / (2 ** (bits - 1))
-        audio = audio.reshape(-1, nch)
-
-        if trim_s is not None:
-            audio = audio[:int(sr * trim_s)]
-
-        if sr != 44100:
-            g = gcd(44100, sr)
-            audio = resample_poly(audio, 44100 // g, sr // g, axis=0)
-
-        if nch == 1:
-            audio = np.column_stack([audio, audio])
-
-        s16 = (np.clip(audio, -1, 1) * 32767).astype(np.int16)
-        return pygame.sndarray.make_sound(np.ascontiguousarray(s16))
+    def _load_wav(path: str, trim_s: float = None, amplify: float = 1.0) -> pygame.mixer.Sound:
+        """Load a WAV file as a pygame Sound. pygame handles sample-rate conversion.
+        trim_s: if set, truncate to this many seconds.
+        amplify: multiply sample data by this factor (>1.0 makes it louder than set_volume allows)."""
+        snd = pygame.mixer.Sound(path)
+        if trim_s is not None or amplify != 1.0:
+            arr = pygame.sndarray.array(snd).astype(np.float32)
+            if trim_s is not None:
+                mixer_freq, _, _ = pygame.mixer.get_init()
+                n = int(trim_s * mixer_freq)
+                if len(arr) > n:
+                    arr = arr[:n]
+            if amplify != 1.0:
+                arr = np.clip(arr * amplify, -32768, 32767)
+            snd = pygame.sndarray.make_sound(np.ascontiguousarray(arr.astype(np.int16)))
+        return snd
 
     def _init_sounds(self):
         SR = 44100  # sample rate
 
         # ── snd_shoot: real revolver WAV, trimmed to first shot (~0.25 s) ──
         try:
-            self.snd_shoot = self._load_wav("revolver_shot.wav", trim_s=0.25)
+            self.snd_shoot = self._load_wav(
+                os.path.join(_ASSETS_DIR, "revolver_shot.wav"), trim_s=0.25)
         except Exception as e:
             print(f"[!] revolver_shot.wav failed ({e}) — using fallback")
             self.snd_shoot = None
@@ -552,11 +605,17 @@ class FPSGame:
             print(f"[!] snd_hit_tink generation failed: {e}")
             self.snd_hit_tink = None
 
-        # ── snd_reload: real revolver reload WAV ──
+        # ── snd_reload: real revolver reload WAV (tries underscore then space) ──
         try:
-            self.snd_reload = self._load_wav("revolver_reload.wav")
+            _rp = os.path.join(_ASSETS_DIR, "revolver_reload.wav")
+            if not os.path.exists(_rp):
+                _rp = os.path.join(_ASSETS_DIR, "revolver reload.wav")
+            if not os.path.exists(_rp):
+                raise FileNotFoundError(f"Neither 'revolver_reload.wav' nor 'revolver reload.wav' found in {_ASSETS_DIR}")
+            self.snd_reload = self._load_wav(_rp, amplify=2.5)
+            print(f"[OK] Reload sound loaded: {os.path.basename(_rp)}")
         except Exception as e:
-            print(f"[!] snd_reload generation failed: {e}")
+            print(f"[!] snd_reload failed: {e}")
             self.snd_reload = None
 
         # ── snd_hit: high metallic ping ──
@@ -603,16 +662,19 @@ class FPSGame:
             self.snd_reload.set_volume(RELOAD_VOLUME)
 
     def _set_volume(self, vol: float):
-        """Set master volume for all sounds and show the HUD indicator."""
+        """Set master volume for all sounds + music and show the HUD indicator."""
         self._current_volume = round(vol, 1)
         for snd in (self.snd_shoot, self.snd_hit_tink,
                     self.snd_hit, self.snd_damage, self.snd_empty):
             if snd is not None:
                 snd.set_volume(self._current_volume)
-        # Reload gets the same scaling relative to its original RELOAD_VOLUME ratio
         if self.snd_reload is not None:
-            ratio = RELOAD_VOLUME / max(SOUND_VOLUME, 0.01)
-            self.snd_reload.set_volume(min(1.0, self._current_volume * ratio))
+            self.snd_reload.set_volume(min(1.0, self._current_volume))
+        # Scale music proportionally to slider (music sits lower than SFX)
+        try:
+            pygame.mixer.music.set_volume(self._current_volume * MUSIC_VOLUME)
+        except Exception:
+            pass
         self._vol_display_until = time.time() + 2.0
 
     def _play(self, snd):
@@ -816,6 +878,9 @@ class FPSGame:
 
         now = time.time()
 
+        # Expire dead zones
+        self._dead_zones = [dz for dz in self._dead_zones if dz[4] > now]
+
         # Remove NPCs that have been dead long enough
         self.npcs = [n for n in self.npcs
                      if n.kill_time is None or (now - n.kill_time) < KILL_LINGER]
@@ -866,9 +931,19 @@ class FPSGame:
                 self.npcs[best_idx].last_seen = now
                 matched.add(best_idx)
             else:
-                # Only spawn a new NPC if no existing NPC overlaps this box
-                if not any(iou(new_box, tuple(int(v) for v in n.display_box)) > 0.1
-                           for n in self.npcs) and len(self.npcs) < 8:
+                # Don't spawn if another live NPC overlaps, or box centre is near a dead zone
+                new_cx = (x1 + x2) // 2
+                new_cy = (y1 + y2) // 2
+                new_w  = x2 - x1
+                expand = max(60, int(new_w * 0.5))
+                in_dead = any(
+                    dz[0] - expand <= new_cx <= dz[2] + expand and
+                    dz[1] - expand <= new_cy <= dz[3] + expand
+                    for dz in self._dead_zones
+                )
+                no_overlap = not any(iou(new_box, tuple(int(v) for v in n.display_box)) > 0.1
+                                     for n in self.npcs)
+                if no_overlap and not in_dead and len(self.npcs) < 8:
                     self.npcs.append(NPC(x1, y1, x2, y2))
 
     @staticmethod
@@ -928,6 +1003,7 @@ class FPSGame:
             damage = 25
             targeted.health    = max(0, targeted.health - damage)
             targeted.hit_flash = 0.25
+            targeted.engaged   = True
             self.hit_markers.append(
                 HitMarker(int(self.ch_x), int(self.ch_y), confirmed=True))
             self.score += 50
@@ -938,6 +1014,12 @@ class FPSGame:
                 self.score += 150   # kill bonus
                 self._play(self.snd_hit)
                 self.kill_feed.append([time.time(), "HOSTILE ELIMINATED"])
+                # Block this region for 6 seconds and show death icon there
+                x1, y1, x2, y2 = targeted.box
+                cx = (x1 + x2) // 2
+                cy = (y1 + y2) // 2
+                icon_until = time.time() + 1.5   # skull visible for 1.5 s then hides
+                self._dead_zones.append((x1, y1, x2, y2, time.time() + 6.0, cx, cy, icon_until))
         else:
             # ── Miss — standard gunshot only ──
             self._play(self.snd_shoot)
@@ -949,11 +1031,14 @@ class FPSGame:
             self.start_reload()
 
     def start_reload(self):
-        if not self.reloading and self.ammo < self.max_ammo:
-            self.reloading    = True
-            self.reload_start = time.time()
-            self.gun_reload_y = 0.0
-            self._play(self.snd_reload)
+        if self.reloading:
+            return
+        if self.ammo >= self.max_ammo:
+            return   # already full — no sound, no animation
+        self.reloading    = True
+        self.reload_start = time.time()
+        self.gun_reload_y = 0.0
+        self._play(self.snd_reload)
 
     def take_damage(self, amount=15):
         self.health      = max(0, self.health - amount)
@@ -975,6 +1060,18 @@ class FPSGame:
     # ── update ────────────────────────────────────────────────
 
     def update(self, dt):
+        # ── Camera disconnect detection (phone streaming only) ──────────────
+        if (self.state == "PLAYING" and not USE_WEBCAM_FALLBACK
+                and not self._stream_connecting):
+            stale = time.time() - self._capture.last_frame_time
+            if stale > 5.0:
+                print("[!] Camera stream lost — returning to connect screen")
+                self.state = "CONNECTING"
+                self._title_timer = 0.0
+                self._stream_connecting = True
+                threading.Thread(target=self._connect_stream_bg, daemon=True).start()
+                return
+
         # Crosshair spread decay
         self.crosshair_spread = max(0, self.crosshair_spread - 30 * dt)
 
@@ -1113,16 +1210,10 @@ class FPSGame:
         if self._det_worker is not None:
             self._det_worker.submit(frame)
 
-        # ── cinematic color grade ──────────────────────────────────────────
-        # Boost contrast, slight desaturation, cool blue tint — makes the
-        # raw camera feed look like a game render rather than plain video.
-        frame = cv2.convertScaleAbs(frame, alpha=1.25, beta=-18)   # contrast + lift
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV).astype(np.float32)
-        hsv[:, :, 1] *= 0.72          # desaturate to ~72 % of original
-        hsv[:, :, 1] = np.clip(hsv[:, :, 1], 0, 255)
-        frame = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
-        frame[:, :, 0] = np.clip(frame[:, :, 0].astype(np.int16) + 12, 0, 255)  # blue +12
-        frame[:, :, 2] = np.clip(frame[:, :, 2].astype(np.int16) - 8,  0, 255)  # red  -8
+        # ── map-specific dramatic visual filter ──────────────────────────
+        # Apply contrast boost then the map's signature colour grade
+        frame = cv2.convertScaleAbs(frame, alpha=1.2, beta=-15)   # contrast base
+        frame = self.apply_map_filter(frame)
 
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frame = np.rot90(frame)
@@ -1176,44 +1267,137 @@ class FPSGame:
             pygame.draw.line(self.screen, col,
                 (cx+size, cy+size), (cx+size//2, cy+size//2), thick)
 
+    # Per-map health bar colour palettes — (high_hp, mid_hp, low_hp, targeted, outline)
+    _MAP_HP_COLOURS = [
+        # Arctic  — cyan/ice on cold blue bg, hot colours pop against white
+        ((0, 220, 255),   (255, 210, 60),  (255, 60,  60),  (255, 80,  80),  (0, 60, 100)),
+        # Warzone — bright orange/yellow on sepia, pops against warm tones
+        ((255, 180, 30),  (255, 230, 0),   (220, 40,  40),  (255, 255, 80),  (80, 20, 0)),
+        # Jungle  — white/yellow on green-tinted feed (green would vanish)
+        ((240, 240, 60),  (255, 160, 30),  (220, 40,  40),  (255, 255, 180), (20, 50, 10)),
+        # Night Ops — bright white/yellow on NV-green (green bar would vanish)
+        ((220, 255, 180), (255, 230, 60),  (255, 80,  80),  (255, 255, 255), (0,  40, 20)),
+        # Cyberpunk — neon cyan / magenta on dark hyper-saturated feed
+        ((0,  230, 255),  (255, 0,   200), (255, 40,  80),  (255, 255, 0),   (20, 0,  50)),
+    ]
+
+    def _draw_skull(self, cx: int, cy: int, scale: float = 1.0):
+        """Draw a skull-and-crossbones icon centred at (cx, cy) using pygame primitives."""
+        s = scale
+
+        def p(x, y):  # scale helper
+            return (int(cx + x * s), int(cy + y * s))
+
+        def r(x, y, w, h):  # scaled rect tuple
+            return pygame.Rect(int(cx + x*s), int(cy + y*s), int(w*s), int(h*s))
+
+        # ── Shadow pass (draw everything offset +2, dark) ─────────────────
+        off = 2
+        for col, ox, oy in [((0,0,0), off, off), ((255,255,255), 0, 0)]:
+            # Crossbones — two diagonal bone lines
+            bone_w = int(4 * s)
+            # top-left → bottom-right bone
+            pygame.draw.line(self.screen, col,
+                             p(-14 + ox, -18 + oy), p(14 + ox, 6 + oy), bone_w)
+            # top-right → bottom-left bone
+            pygame.draw.line(self.screen, col,
+                             p(14 + ox, -18 + oy), p(-14 + ox, 6 + oy), bone_w)
+            # Knobby ends (circles at each bone tip)
+            for bx, by in [(-14,-18),(14,-18),(-14,6),(14,6)]:
+                pygame.draw.circle(self.screen, col,
+                                   p(bx + ox, by + oy), int(5 * s))
+
+            # Skull cranium
+            pygame.draw.ellipse(self.screen, col, r(-11+ox, -20+oy, 22, 20))
+            # Jaw
+            pygame.draw.rect(self.screen, col, r(-8+ox, -4+oy, 16, 7), border_radius=int(3*s))
+
+            # Eye sockets (punched out in black regardless of pass)
+            eye_r = int(3.5 * s)
+            pygame.draw.circle(self.screen, (0, 0, 0), p(-4+ox, -13+oy), eye_r)
+            pygame.draw.circle(self.screen, (0, 0, 0), p(4+ox, -13+oy), eye_r)
+
+            # Nose hole
+            pygame.draw.rect(self.screen, (0, 0, 0), r(-1+ox, -8+oy, 2, 3))
+
+            # Teeth — three small rects
+            for tx in [-5, 0, 5]:
+                pygame.draw.rect(self.screen, (0, 0, 0), r(tx+ox, -1+oy, 3, 4))
+
     def draw_npc_overlays(self):
-        """Draw a slim health bar above each detected target. No brackets or labels."""
+        """Draw health bars for engaged/targeted NPCs, and death icons for killed ones."""
+        m = min(self.current_map, len(self._MAP_HP_COLOURS) - 1)
+        col_hi, col_mid, col_lo, col_targeted, col_outline = self._MAP_HP_COLOURS[m]
+
         targeted = self._get_targeted_npc()
+
+        # ── Live NPC health bars (only if engaged or currently targeted) ──
         for npc in self.npcs:
             if npc.health <= 0:
                 continue
+            if not npc.engaged and npc is not targeted:
+                continue  # don't clutter screen with bars for untouched NPCs
 
-            x1, y1, x2, _  = (int(v) for v in npc.display_box)
+            x1, y1, x2, _ = (int(v) for v in npc.display_box)
             w = x2 - x1
             if w <= 0:
                 continue
 
-            pct     = npc.display_health / npc.MAX_HEALTH
-            bar_h   = 5
-            bar_y   = y1 - bar_h - 4
+            pct   = npc.display_health / npc.MAX_HEALTH
+            bar_h = 8
+            bar_y = y1 - bar_h - 6
 
-            # Bar colour: red when crosshair is on this target, else green→orange→red by HP
             if npc is targeted:
-                bar_col = (220, 30, 30)
+                bar_col = col_targeted
             elif npc.hit_flash > 0:
                 bar_col = (255, 255, 255)
             elif pct > 0.5:
-                bar_col = (0, 210, 80)
+                bar_col = col_hi
             elif pct > 0.25:
-                bar_col = (255, 140, 0)
+                bar_col = col_mid
             else:
-                bar_col = (220, 30, 30)
+                bar_col = col_lo
 
-            # Dark background track
-            pygame.draw.rect(self.screen, (15, 15, 15, 180), (x1, bar_y, w, bar_h))
-            # Filled portion
-            pygame.draw.rect(self.screen, bar_col, (x1, bar_y, max(1, int(w * pct)), bar_h))
+            # Outline so bar shows on any background
+            pygame.draw.rect(self.screen, col_outline, (x1 - 1, bar_y - 1, w + 2, bar_h + 2))
+            pygame.draw.rect(self.screen, (10, 10, 10), (x1, bar_y, w, bar_h))
+            pygame.draw.rect(self.screen, bar_col,
+                             (x1, bar_y, max(1, int(w * pct)), bar_h))
+
+        # ── Death icons + respawn countdown for each dead zone ──────────────
+        now = time.time()
+        for dz in self._dead_zones:
+            x1, y1, x2, _y2, exp, cx, cy, icon_until = dz
+            if now > icon_until:
+                continue   # icon expired — respawn block still active, just don't draw
+            remaining = exp - now
+            total_cd  = 6.0
+
+            self._draw_skull(cx, cy)
+
+            # Circular respawn cooldown ring around the skull
+            ring_r = 36
+            prog = remaining / total_cd   # 1.0 → 0.0
+            arc_deg = int(360 * prog)
+            if arc_deg > 0:
+                rect = pygame.Rect(cx - ring_r, cy - ring_r, ring_r * 2, ring_r * 2)
+                pygame.draw.arc(self.screen, (220, 30, 30), rect,
+                                math.radians(90),
+                                math.radians(90 + arc_deg), 3)
+            # Dark ring background
+            pygame.draw.circle(self.screen, (0, 0, 0), (cx, cy), ring_r, 1)
+
+            # Countdown number below icon
+            cd_txt = self.font_small.render(f"{remaining:.1f}s", True, (220, 30, 30))
+            self.screen.blit(cd_txt, cd_txt.get_rect(center=(cx, cy + ring_r + 12)))
 
     def draw_health_bar(self):
         """Valorant-style: large colour-coded HP number + thin bar."""
         x, y = 40, WINDOW_H - 70
         pct = self.health / 100
-        col = (100, 220, 100) if pct > 0.5 else ORANGE if pct > 0.25 else (220, 50, 50)
+        m = min(self.current_map, len(self._MAP_HP_COLOURS) - 1)
+        col_hi, col_mid, col_lo = self._MAP_HP_COLOURS[m][:3]
+        col = col_hi if pct > 0.5 else col_mid if pct > 0.25 else col_lo
 
         # Large HP number
         big = self.font_big.render(str(self.health), True, col)
@@ -1449,6 +1633,483 @@ class FPSGame:
         hint = self.font_small.render("PRESS R TO RESTART", True, WHITE)
         self.screen.blit(hint, hint.get_rect(center=(WINDOW_W//2, WINDOW_H//2 + 70)))
 
+    # ── music ─────────────────────────────────────────────────
+
+    def _set_music(self, track: str):
+        """Switch background music. track = 'menu' | 'game' | None"""
+        if track == self._music_track:
+            return
+        self._music_track = track
+        try:
+            if track == "menu":
+                path = os.path.join(_ASSETS_DIR, "menu_music.mp3")
+                if os.path.exists(path):
+                    pygame.mixer.music.load(path)
+                    pygame.mixer.music.set_volume(self._current_volume * MUSIC_VOLUME)
+                    pygame.mixer.music.play(-1)
+                else:
+                    print(f"[!] menu_music.mp3 not found at {path}")
+            elif track == "game":
+                path = os.path.join(_ASSETS_DIR, "game_start_music.mp3")
+                if os.path.exists(path):
+                    pygame.mixer.music.load(path)
+                    pygame.mixer.music.set_volume(self._current_volume * MUSIC_VOLUME)
+                    pygame.mixer.music.play(-1)
+                else:
+                    print(f"[!] game_start_music.mp3 not found at {path}")
+            elif track is None:
+                pygame.mixer.music.stop()
+        except Exception as e:
+            print(f"[!] Music switch failed ({track}): {e}")
+
+    # ── start new game ───────────────────────────────────────
+
+    def _start_new_game(self):
+        self.score          = 0
+        self.health         = 100
+        self.ammo           = self.max_ammo
+        self.kills          = 0
+        self.game_active    = True
+        self.shoot_cooldown = 0.15
+
+    # ── map video filter ─────────────────────────────────────
+
+    def apply_map_filter(self, frame: np.ndarray) -> np.ndarray:
+        """Apply a dramatic map-specific visual filter to the live BGR frame."""
+        f = MAP_DATA[self.current_map]["filter"]
+
+        if f == "arctic":
+            # Heavy desaturation + cold blue shift
+            grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            grey3 = cv2.cvtColor(grey, cv2.COLOR_GRAY2BGR)
+            out = cv2.addWeighted(frame, 0.15, grey3, 0.85, 0)
+            # Blue channel boost, red drop
+            out = out.astype(np.int16)
+            out[:, :, 0] = np.clip(out[:, :, 0] + 55, 0, 255)  # blue
+            out[:, :, 2] = np.clip(out[:, :, 2] - 25, 0, 255)  # red
+            return out.astype(np.uint8)
+
+        elif f == "warzone":
+            # Harsh sepia + warm orange grade + contrast crunch
+            grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            eq   = cv2.equalizeHist(grey)
+            warm = cv2.merge([
+                np.clip(eq.astype(np.int32) + 10, 0, 255).astype(np.uint8),   # blue-ish
+                np.clip(eq.astype(np.int32) - 5,  0, 255).astype(np.uint8),   # green
+                np.clip(eq.astype(np.int32) + 35, 0, 255).astype(np.uint8),   # red
+            ])
+            return cv2.addWeighted(warm, 0.85, frame, 0.15, 0)
+
+        elif f == "jungle":
+            # Aggressive green channel push + slight haze
+            out = frame.astype(np.int16).copy()
+            out[:, :, 1] = np.clip(out[:, :, 1] + 55, 0, 255)  # green
+            out[:, :, 0] = np.clip(out[:, :, 0] - 20, 0, 255)  # blue
+            out[:, :, 2] = np.clip(out[:, :, 2] - 30, 0, 255)  # red
+            # Slight blur for atmospheric haze
+            blurred = cv2.GaussianBlur(out.astype(np.uint8), (3, 3), 0)
+            return cv2.addWeighted(out.astype(np.uint8), 0.7, blurred, 0.3, 0)
+
+        elif f == "nightops":
+            # True night-vision green — CLAHE contrast + green channel only
+            grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
+            eq = clahe.apply(grey)
+            # Add mild phosphor glow (slight blur overlay)
+            glow = cv2.GaussianBlur(eq, (5, 5), 0)
+            eq = np.clip(eq.astype(np.int16) + glow.astype(np.int16) // 4, 0, 255).astype(np.uint8)
+            nv = cv2.merge([
+                np.zeros_like(eq),
+                np.clip(eq.astype(np.int32) - 20, 0, 255).astype(np.uint8),
+                np.zeros_like(eq),
+            ])
+            return nv
+
+        else:  # cyberpunk
+            # Max saturation + chromatic aberration shift + neon tint
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV).astype(np.float32)
+            hsv[:, :, 1] = np.clip(hsv[:, :, 1] * 2.2, 0, 255)
+            hsv[:, :, 2] = np.clip(hsv[:, :, 2] * 0.80, 0, 255)
+            out = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+            # Chromatic aberration: shift red channel right by 3px
+            r_shifted = np.roll(out[:, :, 2], 3, axis=1)
+            out[:, :, 2] = r_shifted
+            # Neon overlay
+            out = out.astype(np.int16)
+            out[:, :, 0] = np.clip(out[:, :, 0] + 30, 0, 255)  # blue
+            out[:, :, 2] = np.clip(out[:, :, 2] - 10, 0, 255)  # reduce red
+            return out.astype(np.uint8)
+
+    # ── menu background ──────────────────────────────────────
+
+    def _draw_menu_bg(self, map_idx: int = -1):
+        """Dark FPS lobby background with map-tinted atmosphere."""
+        bg = MAP_DATA[map_idx]["bg"] if map_idx >= 0 else (6, 8, 14)
+        self.screen.fill(bg)
+
+        # Subtle hex/grid overlay
+        accent = MAP_DATA[map_idx]["accent"] if map_idx >= 0 else (0, 180, 100)
+        ga = (int(accent[0]*0.06), int(accent[1]*0.06), int(accent[2]*0.06))
+        for x in range(0, WINDOW_W + 60, 60):
+            pygame.draw.line(self.screen, ga, (x, 0), (x, WINDOW_H))
+        for y in range(0, WINDOW_H + 60, 60):
+            pygame.draw.line(self.screen, ga, (0, y), (WINDOW_W, y))
+
+        # Top bar
+        pygame.draw.rect(self.screen, (0, 0, 0), (0, 0, WINDOW_W, 64))
+        pygame.draw.line(self.screen, accent, (0, 64), (WINDOW_W, 64), 1)
+
+        # Game title left-aligned in top bar
+        t1 = self.font_big.render("ROBO", True, (255, 255, 255))
+        t2 = self.font_big.render("-HUNTER", True, accent)
+        self.screen.blit(t1, (30, 10))
+        self.screen.blit(t2, (30 + t1.get_width(), 10))
+
+        # "HACKABOT 2026" right-aligned
+        badge = self.font_small.render("HACKABOT  2026", True, (80, 90, 80))
+        self.screen.blit(badge, (WINDOW_W - badge.get_width() - 30, 24))
+
+        # Bottom bar
+        pygame.draw.rect(self.screen, (0, 0, 0), (0, WINDOW_H - 40, WINDOW_W, 40))
+        pygame.draw.line(self.screen, accent, (0, WINDOW_H - 40), (WINDOW_W, WINDOW_H - 40), 1)
+        hint = self.font_small.render(
+            "↑↓  NAVIGATE    SPACE / ENTER  SELECT    ESC  QUIT    C  ZERO AIM    F11  FULLSCREEN",
+            True, (60, 70, 60))
+        self.screen.blit(hint, hint.get_rect(center=(WINDOW_W // 2, WINDOW_H - 20)))
+
+    # ── connecting screen ─────────────────────────────────────
+
+    def _draw_connecting_screen(self, dt: float):
+        """Blocks at launch until the phone camera is live."""
+        self._title_timer += dt
+        self._draw_menu_bg()
+
+        # Spinner dots
+        dots = "." * (int(self._title_timer * 2) % 4)
+
+        msg = self.font_big.render("CONNECTING TO CAMERA", True, (200, 200, 200))
+        self.screen.blit(msg, msg.get_rect(center=(WINDOW_W // 2, WINDOW_H // 2 - 70)))
+
+        sub = self.font_hud.render(f"Waiting{dots}", True, (0, 180, 100))
+        self.screen.blit(sub, sub.get_rect(center=(WINDOW_W // 2, WINDOW_H // 2)))
+
+        hint = self.font_small.render(
+            "Start  IP Webcam  on your phone  then  tap  'Start server'",
+            True, (50, 70, 50))
+        self.screen.blit(hint, hint.get_rect(center=(WINDOW_W // 2, WINDOW_H // 2 + 60)))
+
+        # Animated scanning line
+        sweep_y = int((self._title_timer * 100) % WINDOW_H)
+        sl = pygame.Surface((WINDOW_W, 2), pygame.SRCALPHA)
+        sl.fill((0, 180, 100, 20))
+        self.screen.blit(sl, (0, sweep_y))
+
+        # Once connected, auto-advance to title
+        if not self._stream_connecting:
+            self.state = "TITLE"
+            self._title_timer = 0.0
+
+    # ── title screen ─────────────────────────────────────────
+
+    def _draw_title_screen(self, dt: float):
+        self._title_timer += dt
+        self._draw_menu_bg()
+
+        # Animated scanline sweep
+        sweep_y = int((self._title_timer * 120) % WINDOW_H)
+        scan_surf = pygame.Surface((WINDOW_W, 2), pygame.SRCALPHA)
+        scan_surf.fill((0, 255, 160, 18))
+        self.screen.blit(scan_surf, (0, sweep_y))
+
+        # Big centred title
+        cy = WINDOW_H // 2 - 60
+        shadow = self.font_big.render("ROBO-HUNTER", True, (0, 0, 0))
+        title  = self.font_big.render("ROBO-HUNTER", True, (255, 255, 255))
+        self.screen.blit(shadow, shadow.get_rect(center=(WINDOW_W // 2 + 3, cy + 3)))
+        self.screen.blit(title,  title.get_rect(center=(WINDOW_W // 2, cy)))
+
+        # Accent line under title
+        lw = title.get_width() + 40
+        lx = WINDOW_W // 2 - lw // 2
+        pygame.draw.line(self.screen, (0, 255, 160), (lx, cy + 36), (lx + lw, cy + 36), 2)
+
+        # Subtitle
+        sub = self.font_med.render("HACKABOT  2026  LIVE  ARENA", True, (120, 130, 120))
+        self.screen.blit(sub, sub.get_rect(center=(WINDOW_W // 2, cy + 60)))
+
+        # Pulsing "PRESS SPACE" prompt
+        pulse = 0.55 + 0.45 * math.sin(self._title_timer * 2.8)
+        col = (int(0 * pulse), int(230 * pulse), int(140 * pulse))
+        msg = self.font_hud.render("PRESS  SPACE  TO  DEPLOY", True, col)
+        self.screen.blit(msg, msg.get_rect(center=(WINDOW_W // 2, cy + 130)))
+
+        # Version tag bottom-left
+        ver = self.font_small.render("v2.0  //  LIVE  CAM  MODE", True, (40, 50, 40))
+        self.screen.blit(ver, (30, WINDOW_H - 60))
+
+    # ── map select screen ────────────────────────────────────
+
+    def _draw_map_select_screen(self, dt: float):
+        self._title_timer += dt
+        m = self.current_map
+        self._draw_menu_bg(m)
+
+        content_top = 74
+        content_bot = WINDOW_H - 40
+
+        # ── LEFT PANEL: map list ─────────────────────────────────────────────
+        panel_w = 340
+        # Semi-transparent left panel
+        panel = pygame.Surface((panel_w, content_bot - content_top), pygame.SRCALPHA)
+        panel.fill((0, 0, 0, 140))
+        self.screen.blit(panel, (0, content_top))
+
+        label = self.font_small.render("SELECT  MAP", True, (120, 130, 100))
+        self.screen.blit(label, (24, content_top + 14))
+        pygame.draw.line(self.screen, (40, 50, 40),
+                         (24, content_top + 32), (panel_w - 24, content_top + 32), 1)
+
+        item_h = 54
+        list_y = content_top + 44
+        for i, md in enumerate(MAP_DATA):
+            y = list_y + i * item_h
+            accent = md["accent"]
+            selected = (i == m)
+
+            if selected:
+                # Highlight bar
+                hl = pygame.Surface((panel_w - 4, item_h - 6), pygame.SRCALPHA)
+                hl.fill((accent[0]//6, accent[1]//6, accent[2]//6, 200))
+                self.screen.blit(hl, (2, y))
+                # Left accent stripe
+                pygame.draw.rect(self.screen, accent, (0, y, 4, item_h - 6))
+
+            # Map index number
+            num_col = accent if selected else (50, 55, 50)
+            num = self.font_small.render(f"{i+1:02d}", True, num_col)
+            self.screen.blit(num, (14, y + 10))
+
+            # Map name
+            name_col = (255, 255, 255) if selected else (130, 140, 130)
+            name_font = self.font_med if selected else self.font_small
+            name_surf = name_font.render(md["name"], True, name_col)
+            self.screen.blit(name_surf, (50, y + (item_h // 2 - name_surf.get_height() // 2) - 3))
+
+            # Tags on selected
+            if selected:
+                tx = 50
+                for tag in md["tags"][:2]:
+                    ts = self.font_small.render(tag, True, accent)
+                    self.screen.blit(ts, (tx, y + item_h - 20))
+                    tx += ts.get_width() + 12
+
+        # ── RIGHT PANEL: map preview ─────────────────────────────────────────
+        right_x = panel_w + 20
+        right_w  = WINDOW_W - right_x - 20
+        right_h  = content_bot - content_top - 10
+        right_y  = content_top + 5
+
+        md = MAP_DATA[m]
+        accent = md["accent"]
+        bg_col = md["bg"]
+
+        # Panel background — gradient effect via stacked rects
+        for i in range(right_h):
+            alpha = i / right_h
+            r = int(bg_col[0] * (1 - alpha * 0.6))
+            g = int(bg_col[1] * (1 - alpha * 0.6))
+            b = int(bg_col[2] * (1 - alpha * 0.6))
+            pygame.draw.line(self.screen, (r, g, b),
+                             (right_x, right_y + i), (right_x + right_w, right_y + i))
+
+        # Animated corner brackets
+        t = self._title_timer
+        blen = int(30 + 20 * abs(math.sin(t * 1.5)))
+        bthk = 2
+        corners = [
+            (right_x + 8, right_y + 8),
+            (right_x + right_w - 8, right_y + 8),
+            (right_x + 8, right_y + right_h - 8),
+            (right_x + right_w - 8, right_y + right_h - 8),
+        ]
+        dirs = [(1, 1), (-1, 1), (1, -1), (-1, -1)]
+        for (cx, cy), (dx, dy) in zip(corners, dirs):
+            pygame.draw.line(self.screen, accent, (cx, cy), (cx + blen * dx, cy), bthk)
+            pygame.draw.line(self.screen, accent, (cx, cy), (cx, cy + blen * dy), bthk)
+
+        # Map name — large
+        name_shadow = self.font_big.render(md["name"], True, (0, 0, 0))
+        name_surf   = self.font_big.render(md["name"], True, accent)
+        nx = right_x + right_w // 2
+        ny = right_y + right_h // 2 - 80
+        self.screen.blit(name_shadow, name_shadow.get_rect(center=(nx + 3, ny + 3)))
+        self.screen.blit(name_surf,   name_surf.get_rect(center=(nx, ny)))
+
+        # Accent line under name
+        nw = name_surf.get_width()
+        pygame.draw.line(self.screen, accent,
+                         (nx - nw // 2, ny + 30), (nx + nw // 2, ny + 30), 2)
+
+        # Subtitle
+        sub = self.font_med.render(md["sub"], True, (160, 165, 155))
+        self.screen.blit(sub, sub.get_rect(center=(nx, ny + 55)))
+
+        # Tags row
+        tag_total_w = sum(
+            self.font_small.size(f"  {tag}  ")[0] + 6 for tag in md["tags"]
+        )
+        tx = nx - tag_total_w // 2
+        ty = ny + 90
+        for tag in md["tags"]:
+            tw, th = self.font_small.size(f"  {tag}  ")
+            pygame.draw.rect(self.screen, (int(accent[0]*0.18), int(accent[1]*0.18), int(accent[2]*0.18)),
+                             (tx, ty, tw + 6, th + 6), border_radius=3)
+            pygame.draw.rect(self.screen, accent, (tx, ty, tw + 6, th + 6), 1, border_radius=3)
+            ts = self.font_small.render(f"  {tag}  ", True, accent)
+            self.screen.blit(ts, (tx + 3, ty + 3))
+            tx += tw + 6 + 8
+
+        # "DEPLOY" button — animated
+        pulse = 0.6 + 0.4 * math.sin(self._title_timer * 3.0)
+        btn_col  = (int(accent[0] * pulse), int(accent[1] * pulse), int(accent[2] * pulse))
+        btn_surf = self.font_hud.render("[ SPACE ]  DEPLOY", True, btn_col)
+        by = right_y + right_h - 60
+        self.screen.blit(btn_surf, btn_surf.get_rect(center=(nx, by)))
+
+        # Scanline sweep across right panel
+        sweep_y = right_y + int((self._title_timer * 80) % right_h)
+        sl = pygame.Surface((right_w, 2), pygame.SRCALPHA)
+        sl.fill((accent[0], accent[1], accent[2], 14))
+        self.screen.blit(sl, (right_x, sweep_y))
+
+    # ── calibrating screen ───────────────────────────────────
+
+    def _draw_calibrating_screen(self, dt: float):
+        self._calib_timer += dt
+        self._draw_menu_bg(self.current_map)
+
+        accent = MAP_DATA[self.current_map]["accent"]
+        cx = WINDOW_W // 2
+        cy = WINDOW_H // 2
+
+        # Title
+        title = self.font_big.render("CALIBRATING GUN", True, accent)
+        self.screen.blit(title, title.get_rect(center=(cx, cy - 80)))
+
+        # Instructions
+        instr = self.font_med.render("Hold gun level and still...", True, (160, 165, 155))
+        self.screen.blit(instr, instr.get_rect(center=(cx, cy - 30)))
+
+        # Progress bar
+        bar_w, bar_h = 400, 18
+        bx = cx - bar_w // 2
+        by = cy + 20
+        elapsed = max(0.0, self._calib_timer - self._calib_delay)
+        progress = min(1.0, elapsed / self._calib_duration)
+
+        pygame.draw.rect(self.screen, (30, 35, 30), (bx, by, bar_w, bar_h), border_radius=4)
+        if progress > 0:
+            pygame.draw.rect(self.screen, accent,
+                             (bx, by, int(bar_w * progress), bar_h), border_radius=4)
+        pygame.draw.rect(self.screen, (80, 90, 80), (bx, by, bar_w, bar_h), 1, border_radius=4)
+
+        # Percentage
+        pct_txt = self.font_small.render(f"{int(progress * 100)}%", True, (160, 165, 155))
+        self.screen.blit(pct_txt, pct_txt.get_rect(center=(cx, by + bar_h + 16)))
+
+        # Done — advance to countdown
+        if progress >= 1.0:
+            self._set_music("game")
+            self.state = "COUNTDOWN"
+            self._countdown_val   = 3
+            self._countdown_timer = 0.0
+
+        # GET READY flash once bar fills
+        if progress >= 0.98:
+            ready = self.font_hud.render("GET READY", True, accent)
+            self.screen.blit(ready, ready.get_rect(center=(cx, cy + 90)))
+
+    # ── countdown screen ─────────────────────────────────────
+
+    def _draw_countdown_screen(self, dt: float):
+        self._countdown_timer += dt
+        self._draw_menu_bg(self.current_map)
+
+        accent = MAP_DATA[self.current_map]["accent"]
+        cx = WINDOW_W // 2
+        cy = WINDOW_H // 2
+
+        # Map name banner
+        map_lbl = self.font_med.render(MAP_DATA[self.current_map]["name"], True, (160, 165, 155))
+        self.screen.blit(map_lbl, map_lbl.get_rect(center=(cx, cy - 100)))
+
+        # Countdown number — pulsing
+        if self._countdown_timer >= 1.0:
+            self._countdown_val -= 1
+            self._countdown_timer = 0.0
+
+        if self._countdown_val <= 0:
+            self._start_new_game()
+            self.state = "PLAYING"
+            return
+
+        pulse = 1.0 - (self._countdown_timer * 0.6)
+        num_col = (int(accent[0] * pulse), int(accent[1] * pulse), int(accent[2] * pulse))
+        num_surf = self.font_big.render(str(self._countdown_val), True, num_col)
+        self.screen.blit(num_surf, num_surf.get_rect(center=(cx, cy)))
+
+        deploy = self.font_med.render("DEPLOYING...", True, (120, 130, 120))
+        self.screen.blit(deploy, deploy.get_rect(center=(cx, cy + 70)))
+
+    # ── end / debrief screen ─────────────────────────────────
+
+    def _draw_end_screen(self):
+        m = self.current_map
+        accent = MAP_DATA[m]["accent"]
+
+        overlay = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 210))
+        self.screen.blit(overlay, (0, 0))
+
+        # Top banner
+        pygame.draw.rect(self.screen, (0, 0, 0), (0, 0, WINDOW_W, 70))
+        pygame.draw.line(self.screen, accent, (0, 70), (WINDOW_W, 70), 2)
+
+        title = self.font_big.render("MISSION  DEBRIEF", True, accent)
+        self.screen.blit(title, title.get_rect(center=(WINDOW_W // 2, 35)))
+
+        # Stats box
+        box_w, box_h = 500, 260
+        bx = WINDOW_W // 2 - box_w // 2
+        by = 110
+        box = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
+        box.fill((0, 0, 0, 160))
+        self.screen.blit(box, (bx, by))
+        pygame.draw.rect(self.screen, accent, (bx, by, box_w, box_h), 1)
+        pygame.draw.rect(self.screen, accent, (bx, by, box_w, 30))
+        lbl = self.font_small.render("COMBAT  STATISTICS", True, (0, 0, 0))
+        self.screen.blit(lbl, lbl.get_rect(center=(WINDOW_W // 2, by + 14)))
+
+        stats = [
+            ("SCORE",    str(self.score)),
+            ("KILLS",    str(self.kills)),
+            ("MAP",      MAP_DATA[m]["name"]),
+        ]
+        for j, (label, val) in enumerate(stats):
+            y = by + 45 + j * 60
+            pygame.draw.line(self.screen, (30, 35, 30),
+                             (bx + 20, y + 44), (bx + box_w - 20, y + 44), 1)
+            lsurf = self.font_small.render(label, True, (120, 130, 110))
+            vsurf = self.font_hud.render(val, True, (240, 240, 240))
+            self.screen.blit(lsurf, (bx + 24, y))
+            self.screen.blit(vsurf, (bx + box_w - vsurf.get_width() - 24, y - 4))
+
+        restart = self.font_hud.render("[ R ]  REDEPLOY", True, accent)
+        self.screen.blit(restart, restart.get_rect(center=(WINDOW_W // 2, by + box_h + 50)))
+
+        map_label = self.font_small.render(f"MAP:  {MAP_DATA[m]['name']}  //  {MAP_DATA[m]['sub']}", True, (70, 80, 70))
+        self.screen.blit(map_label, map_label.get_rect(center=(WINDOW_W // 2, WINDOW_H - 30)))
+
     # ── main loop ────────────────────────────────────────────
 
     def run(self):
@@ -1456,10 +2117,13 @@ class FPSGame:
         prev_time = time.time()
 
         print("[*] Game running!")
-        print("    SPACE or LEFT CLICK  = shoot")
-        print("    R                    = reload")
+        print("    SPACE / ENTER        = confirm / shoot")
+        print("    UP / DOWN            = navigate menus")
+        print("    R                    = reload / redeploy")
         print("    D                    = simulate taking damage")
         print("    ESC                  = quit")
+        print("    C                    = zero aim")
+        print("    F11                  = toggle fullscreen")
         if ENABLE_SERIAL:
             print(f"    Pico 1 serial        = {SERIAL_PORT} @ {SERIAL_BAUD} baud")
         if ENABLE_DETECTION:
@@ -1468,7 +2132,7 @@ class FPSGame:
 
         while running:
             now      = time.time()
-            dt       = now - prev_time
+            dt       = min(now - prev_time, 0.05)   # cap dt to avoid spiral on lag
             prev_time = now
 
             # ── EVENTS ──────────────────────────────────────
@@ -1477,21 +2141,9 @@ class FPSGame:
                     running = False
 
                 if event.type == pygame.KEYDOWN:
+                    # Global keys (always active)
                     if event.key == pygame.K_ESCAPE:
                         running = False
-                    if event.key == pygame.K_r:
-                        if not self.game_active:
-                            self.reset()
-                        else:
-                            self.start_reload()
-                    if event.key == pygame.K_SPACE and self.game_active:
-                        self.shoot()
-                    if event.key == pygame.K_d and self.game_active:
-                        self.take_damage()
-                    if event.key == pygame.K_LEFTBRACKET:
-                        self._set_volume(max(0.0, self._current_volume - 0.1))
-                    if event.key == pygame.K_RIGHTBRACKET:
-                        self._set_volume(min(1.0, self._current_volume + 0.1))
                     if event.key == pygame.K_F11:
                         self._toggle_fullscreen()
                     if event.key == pygame.K_c:
@@ -1500,6 +2152,37 @@ class FPSGame:
                         self.ch_x = float(WINDOW_W // 2)
                         self.ch_y = float(WINDOW_H // 2)
                         self._rezero_flash = 1.5
+                    if event.key == pygame.K_LEFTBRACKET:
+                        self._set_volume(max(0.0, self._current_volume - 0.1))
+                    if event.key == pygame.K_RIGHTBRACKET:
+                        self._set_volume(min(1.0, self._current_volume + 0.1))
+
+                    # ── Menu / state navigation ──
+                    if self.state == "TITLE":
+                        if event.key == pygame.K_SPACE:
+                            self.state = "MAP_SELECT"
+                    elif self.state == "MAP_SELECT":
+                        if event.key == pygame.K_UP:
+                            self.current_map = (self.current_map - 1) % len(MAP_DATA)
+                        elif event.key == pygame.K_DOWN:
+                            self.current_map = (self.current_map + 1) % len(MAP_DATA)
+                        elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                            self.state = "CALIBRATING"
+                            self._calib_timer = 0.0
+                    elif self.state == "END":
+                        if event.key == pygame.K_r:
+                            self.state = "TITLE"
+                            self._title_timer = 0.0
+                            self._set_music("menu")
+
+                    # ── In-game keys ──
+                    if self.state == "PLAYING":
+                        if event.key == pygame.K_r:
+                            self.start_reload()
+                        if event.key == pygame.K_SPACE:
+                            self.shoot()
+                        if event.key == pygame.K_d:
+                            self.take_damage()
 
                 # Mouse moves crosshair when gun serial is not connected (testing)
                 if event.type == pygame.MOUSEMOTION:
@@ -1525,15 +2208,51 @@ class FPSGame:
                             self._vol_dragging = True
                             frac = (event.pos[0] - sx) / sw
                             self._set_volume(max(0.0, min(1.0, frac)))
-                        elif self.game_active:
+                        elif self.state == "PLAYING" and self.game_active:
                             self.shoot()
 
             # ── UPDATE ──────────────────────────────────────
-            self.update(dt)
+            if self.state == "PLAYING":
+                self.update(dt)
+                # Transition to END when health depleted
+                if not self.game_active:
+                    self.state = "END"
 
             # ── DRAW ────────────────────────────────────────
-            # 1. Video frame (with screen shake offset)
             self.screen.fill((0, 0, 0))
+
+            # ── Menu states — no camera feed needed ──
+            if self.state == "CONNECTING":
+                self._draw_connecting_screen(dt)
+                pygame.display.flip()
+                self.clock.tick(60)
+                continue
+
+            if self.state == "TITLE":
+                self._draw_title_screen(dt)
+                pygame.display.flip()
+                self.clock.tick(60)
+                continue
+
+            if self.state == "MAP_SELECT":
+                self._draw_map_select_screen(dt)
+                pygame.display.flip()
+                self.clock.tick(60)
+                continue
+
+            if self.state == "CALIBRATING":
+                self._draw_calibrating_screen(dt)
+                pygame.display.flip()
+                self.clock.tick(60)
+                continue
+
+            if self.state == "COUNTDOWN":
+                self._draw_countdown_screen(dt)
+                pygame.display.flip()
+                self.clock.tick(60)
+                continue
+
+            # ── PLAYING / END — show live camera feed ──
 
             # Show connecting screen while stream isn't ready yet
             if self._stream_connecting:
@@ -1553,20 +2272,20 @@ class FPSGame:
                 err = self.font_med.render("NO VIDEO SIGNAL", True, RED)
                 self.screen.blit(err, err.get_rect(center=(WINDOW_W//2, WINDOW_H//2)))
 
-            # 2. NPC detection overlays
+            # NPC detection overlays
             self.draw_npc_overlays()
 
-            # 3. Shoot flash (screen-wide muzzle brightness)
+            # Shoot flash (screen-wide muzzle brightness)
             self.draw_shoot_flash()
 
-            # 4. Vignette + scanlines
+            # Vignette + scanlines
             self.screen.blit(self._vignette, (0, 0))
             self.screen.blit(self._scanlines, (0, 0))
 
-            # 5. Muzzle flash (at crosshair, no gun model)
+            # Muzzle flash (at crosshair, no gun model)
             self.draw_muzzle_flash()
 
-            # 6. HUD
+            # HUD
             self.draw_corner_brackets()
             self.draw_exit_button()
             self.draw_hud_title()
@@ -1581,19 +2300,19 @@ class FPSGame:
             self.draw_serial_status()
             self.draw_volume_slider()
 
-            # 7. Re-zero flash
+            # Re-zero flash
             if self._rezero_flash > 0:
                 alpha = min(1.0, self._rezero_flash)
                 col   = (int(100 * alpha), int(255 * alpha), int(100 * alpha))
                 txt   = self.font_med.render("AIM ZEROED", True, col)
                 self.screen.blit(txt, txt.get_rect(center=(WINDOW_W // 2, WINDOW_H // 2 - 60)))
 
-            # 8. Damage flash (on top of everything)
+            # Damage flash (on top of everything)
             self.draw_damage_flash()
 
-            # 8. Game over screen
-            if not self.game_active:
-                self.draw_game_over()
+            # END state — show debrief overlay on top of frozen frame
+            if self.state == "END":
+                self._draw_end_screen()
 
             pygame.display.flip()
             self.clock.tick(60)
