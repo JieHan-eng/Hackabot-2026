@@ -142,8 +142,8 @@ RELOAD_VOLUME = 1.0   # ← raise this if reload is still too soft
 #    JOY:x,y        — joystick values  -100 to +100, e.g. JOY:0,75
 #                     forwarded to robot via nRF24 for movement
 #
-ENABLE_SERIAL = False
-SERIAL_PORT   = "COM3"    # ← CHANGE THIS to your Pico's COM port
+ENABLE_SERIAL = True      # set False to use mouse aim instead
+SERIAL_PORT   = "AUTO"    # "AUTO" = find Pico automatically, or set e.g. "COM4"
 SERIAL_BAUD   = 115200
 
 # ─── AIM / CROSSHAIR CONFIG ───────────────────────────────────
@@ -152,10 +152,14 @@ SERIAL_BAUD   = 115200
 #                    e.g. 45 means ±45° of yaw covers the full screen width
 #  AIM_PITCH_RANGE : same but for up/down
 #  AIM_SMOOTHING   : 0.0 = raw (jittery), 1.0 = never moves. 0.25 is a good start.
+#  AIM_YAW_INVERT  : set True if turning gun right moves crosshair LEFT
+#  AIM_PITCH_INVERT: set True if aiming gun UP moves crosshair DOWN
 #
-AIM_YAW_RANGE   = 45.0    # degrees — tune to how wide your physical sweep is
-AIM_PITCH_RANGE = 30.0    # degrees
-AIM_SMOOTHING   = 0.25    # low-pass smoothing on crosshair position (0 = off)
+AIM_YAW_RANGE    = 45.0    # degrees — tune to how wide your physical sweep is
+AIM_PITCH_RANGE  = 20.0    # degrees
+AIM_SMOOTHING    = 0.25    # low-pass smoothing on crosshair position (0 = off)
+AIM_YAW_INVERT   = False   # flip left/right if crosshair goes wrong way
+AIM_PITCH_INVERT = False   # flip up/down   if crosshair goes wrong way
 
 # ─── COLOURS ──────────────────────────────────
 BLACK       = (0,   0,   0)
@@ -320,6 +324,10 @@ class CameraCapture:
             new_cap.release()
         return False
 
+    def reconnect_cap(self, cap: cv2.VideoCapture):
+        """Directly swap in an already-opened VideoCapture."""
+        self._swap(cap)
+
     def release(self):
         self._alive = False
         with self._lock:
@@ -456,16 +464,22 @@ class FPSGame:
         # Serial events from Pico 1
         self._serial_events: queue.Queue = queue.Queue()
         self._serial_conn = None
+        self._dbg_yaw   = 0.0   # last received yaw (for debug display)
+        self._dbg_pitch = 0.0   # last received pitch (for debug display)
+        self._aim_yaw_offset   = 0.0  # subtracted from all AIM yaw readings
+        self._aim_pitch_offset = 0.0  # subtracted from all AIM pitch readings
+        self._rezero_flash     = 0.0  # seconds remaining for "AIM ZEROED" flash
         if ENABLE_SERIAL and SERIAL_AVAILABLE:
             self._init_serial()
         elif ENABLE_SERIAL and not SERIAL_AVAILABLE:
             print("[!] ENABLE_SERIAL=True but pyserial is not installed")
 
-        # Video stream — wrapped in CameraCapture for lag-free latest-frame access
-        raw_cap = self._connect_stream()
-        self._capture        = CameraCapture(raw_cap)
-        self._last_surface   = None   # last successfully rendered pygame surface
-        self._reconnect_after = 0.0   # epoch time before which reconnects are suppressed
+        # Video stream — connect in background so window opens immediately
+        self._capture         = CameraCapture(cv2.VideoCapture())  # blank until connected
+        self._last_surface    = None
+        self._reconnect_after = 0.0
+        self._stream_connecting = True
+        threading.Thread(target=self._connect_stream_bg, daemon=True).start()
 
     # ── procedural sound generation ──────────────────────────
 
@@ -639,14 +653,49 @@ class FPSGame:
 
     # ── serial ───────────────────────────────────────────────
 
-    def _init_serial(self):
+    def _find_pico_port(self):
+        """Scan serial ports and return the first one that looks like a Pico."""
         try:
-            self._serial_conn = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=0.01)
+            from serial.tools import list_ports
+            ports = list(list_ports.comports())
+            # First pass: explicit Pico/MicroPython keywords
+            pico_keywords = ("pico", "micropython", "rp2", "rp2040", "rp2350")
+            for p in ports:
+                desc = (p.description or "").lower()
+                mfr  = (p.manufacturer or "").lower()
+                if any(k in desc or k in mfr for k in pico_keywords):
+                    return p.device
+            # Second pass: USB Serial Device (not Bluetooth)
+            for p in ports:
+                desc = (p.description or "").lower()
+                if "usb serial" in desc and "bluetooth" not in desc:
+                    return p.device
+            # Last resort: any non-Bluetooth port
+            for p in ports:
+                desc = (p.description or "").lower()
+                if "bluetooth" not in desc:
+                    return p.device
+        except Exception:
+            pass
+        return None
+
+    def _init_serial(self):
+        port = SERIAL_PORT
+        if port == "AUTO":
+            port = self._find_pico_port()
+            if port:
+                print(f"[OK] Auto-detected Pico on {port}")
+            else:
+                print("[!] AUTO port detection failed — no serial ports found")
+                print("    Plug in the Pico and restart, or set SERIAL_PORT manually")
+                return
+        try:
+            self._serial_conn = serial.Serial(port, SERIAL_BAUD, timeout=0.01)
             t = threading.Thread(target=self._serial_thread, daemon=True)
             t.start()
-            print(f"[OK] Serial connected on {SERIAL_PORT} @ {SERIAL_BAUD} baud")
+            print(f"[OK] Serial connected on {port} @ {SERIAL_BAUD} baud")
         except Exception as e:
-            print(f"[!] Serial open failed ({SERIAL_PORT}): {e}")
+            print(f"[!] Serial open failed ({port}): {e}")
             print("    Check SERIAL_PORT in config and that the Pico is plugged in.")
 
     def _serial_thread(self):
@@ -709,7 +758,7 @@ class FPSGame:
             print("[!] No webcam found — close other apps using the camera (Teams, Discord, etc.).")
             sys.exit(1)
 
-        print(f"\n[*] Scanning {len(STREAM_CANDIDATES)} stream URLs for {PHONE_IP} …")
+        print(f"\n[*] Scanning {len(STREAM_CANDIDATES)} stream URLs for {PHONE_IP} …", flush=True)
         for url in STREAM_CANDIDATES:
             print(f"    Trying {url} … ", end="", flush=True)
             cap = cv2.VideoCapture(url)
@@ -739,8 +788,18 @@ class FPSGame:
         for url in STREAM_CANDIDATES:
             if url.startswith("http"):
                 print(f"       {url}")
-        print("\n    Set USE_WEBCAM_FALLBACK = True to test without a phone.")
-        sys.exit(1)
+        print("\n    Game will keep retrying — start IP Webcam on your phone and it will connect.")
+        raise SystemExit  # caught by _connect_stream_bg, game keeps running
+
+    def _connect_stream_bg(self):
+        """Connect to camera in background — swaps into _capture when ready."""
+        try:
+            cap = self._connect_stream()
+            self._capture.reconnect_cap(cap)
+        except SystemExit:
+            print("[!] Could not connect to any stream. Game will show black until camera is available.")
+        finally:
+            self._stream_connecting = False
 
     def _try_reconnect(self):
         """Attempt to reconnect to the last working URL via CameraCapture."""
@@ -854,6 +913,12 @@ class FPSGame:
         self.shake_x    = random.uniform(-6, 6)
         self.shake_y    = random.uniform(-14, -6)
         self.shake_time = 0.10
+        # Check if crosshair is on the exit button
+        ex, ey, ew, eh = self._exit_btn_rect()
+        if ex <= int(self.ch_x) <= ex + ew and ey <= int(self.ch_y) <= ey + eh:
+            pygame.quit()
+            sys.exit(0)
+
         # Check if crosshair is on a live NPC
         targeted = self._get_targeted_npc()
         if targeted:
@@ -916,6 +981,10 @@ class FPSGame:
         # Flash timers
         self.damage_flash = max(0, self.damage_flash - dt)
         self.shoot_flash  = max(0, self.shoot_flash  - dt)
+
+        # Re-zero flash timer
+        if self._rezero_flash > 0:
+            self._rezero_flash = max(0.0, self._rezero_flash - dt)
 
         # Screen shake
         if self.shake_time > 0:
@@ -988,10 +1057,16 @@ class FPSGame:
             # AIM tuple — update crosshair from IMU angles
             if isinstance(event, tuple) and event[0] == "AIM":
                 _, yaw, pitch = event
+                self._dbg_yaw, self._dbg_pitch = yaw, pitch
+                if AIM_YAW_INVERT:   yaw   = -yaw
+                if AIM_PITCH_INVERT: pitch = -pitch
+                yaw   -= self._aim_yaw_offset
+                pitch -= self._aim_pitch_offset
                 # Map yaw  ±AIM_YAW_RANGE   → screen X 0..WINDOW_W
                 #     pitch ±AIM_PITCH_RANGE → screen Y 0..WINDOW_H
-                target_x = (yaw   / AIM_YAW_RANGE  + 1.0) * 0.5 * WINDOW_W
-                target_y = (pitch / AIM_PITCH_RANGE + 1.0) * 0.5 * WINDOW_H
+                # Negative pitch = gun aimed up = crosshair near top (low Y)
+                target_x = ( yaw   / AIM_YAW_RANGE   + 1.0) * 0.5 * WINDOW_W
+                target_y = (-pitch / AIM_PITCH_RANGE  + 1.0) * 0.5 * WINDOW_H
                 target_x = max(0.0, min(float(WINDOW_W), target_x))
                 target_y = max(0.0, min(float(WINDOW_H), target_y))
                 s = AIM_SMOOTHING
@@ -1330,9 +1405,24 @@ class FPSGame:
             self.screen.blit(txt,
                 txt.get_rect(centerx=WINDOW_W // 2).move(0, WINDOW_H // 2 + 60))
 
+    def _exit_btn_rect(self):
+        """Returns (x, y, w, h) of the exit button hit area."""
+        return (14, 14, 70, 26)
+
+    def draw_exit_button(self):
+        x, y, w, h = self._exit_btn_rect()
+        cx, cy = int(self.ch_x), int(self.ch_y)
+        hovered = x <= cx <= x + w and y <= cy <= y + h
+        col = (220, 50, 50) if hovered else (120, 30, 30)
+        pygame.draw.rect(self.screen, col, (x, y, w, h), border_radius=4)
+        pygame.draw.rect(self.screen, (200, 80, 80) if hovered else (80, 20, 20),
+                         (x, y, w, h), 1, border_radius=4)
+        lbl = self.font_small.render("[ EXIT ]", True, (255, 200, 200) if hovered else (180, 80, 80))
+        self.screen.blit(lbl, (x + (w - lbl.get_width()) // 2, y + (h - lbl.get_height()) // 2))
+
     def draw_hud_title(self):
         txt = self.font_small.render("ROBO-HUNTER  //  HACKABOT 2026", True, (50, 100, 60))
-        self.screen.blit(txt, (40, 14))
+        self.screen.blit(txt, (100, 14))
 
     def draw_serial_status(self):
         if ENABLE_SERIAL:
@@ -1340,6 +1430,10 @@ class FPSGame:
             col    = HUD_DIM if self._serial_conn else (100, 40, 40)
             txt    = self.font_small.render(status, True, col)
             self.screen.blit(txt, (WINDOW_W - txt.get_width() - 10, WINDOW_H - 24))
+            if self._serial_conn:
+                dbg = self.font_small.render(
+                    f"YAW:{self._dbg_yaw:>6.1f}  PITCH:{self._dbg_pitch:>6.1f}", True, HUD_DIM)
+                self.screen.blit(dbg, (WINDOW_W - dbg.get_width() - 10, WINDOW_H - 44))
 
     def draw_game_over(self):
         overlay = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
@@ -1400,6 +1494,12 @@ class FPSGame:
                         self._set_volume(min(1.0, self._current_volume + 0.1))
                     if event.key == pygame.K_F11:
                         self._toggle_fullscreen()
+                    if event.key == pygame.K_c:
+                        self._aim_yaw_offset   = self._dbg_yaw
+                        self._aim_pitch_offset = self._dbg_pitch
+                        self.ch_x = float(WINDOW_W // 2)
+                        self.ch_y = float(WINDOW_H // 2)
+                        self._rezero_flash = 1.5
 
                 # Mouse moves crosshair when gun serial is not connected (testing)
                 if event.type == pygame.MOUSEMOTION:
@@ -1434,6 +1534,17 @@ class FPSGame:
             # ── DRAW ────────────────────────────────────────
             # 1. Video frame (with screen shake offset)
             self.screen.fill((0, 0, 0))
+
+            # Show connecting screen while stream isn't ready yet
+            if self._stream_connecting:
+                msg = self.font_med.render("Connecting to camera...", True, (80, 180, 80))
+                sub = self.font_small.render("Start IP Webcam on your phone", True, (60, 100, 60))
+                self.screen.blit(msg, msg.get_rect(center=(WINDOW_W // 2, WINDOW_H // 2 - 20)))
+                self.screen.blit(sub, sub.get_rect(center=(WINDOW_W // 2, WINDOW_H // 2 + 20)))
+                pygame.display.flip()
+                self.clock.tick(60)
+                continue
+
             frame = self.get_frame()
             sx, sy = int(self.shake_x), int(self.shake_y)
             if frame:
@@ -1457,6 +1568,7 @@ class FPSGame:
 
             # 6. HUD
             self.draw_corner_brackets()
+            self.draw_exit_button()
             self.draw_hud_title()
             self.draw_crosshair()
             self.draw_hit_markers()
@@ -1469,7 +1581,14 @@ class FPSGame:
             self.draw_serial_status()
             self.draw_volume_slider()
 
-            # 7. Damage flash (on top of everything)
+            # 7. Re-zero flash
+            if self._rezero_flash > 0:
+                alpha = min(1.0, self._rezero_flash)
+                col   = (int(100 * alpha), int(255 * alpha), int(100 * alpha))
+                txt   = self.font_med.render("AIM ZEROED", True, col)
+                self.screen.blit(txt, txt.get_rect(center=(WINDOW_W // 2, WINDOW_H // 2 - 60)))
+
+            # 8. Damage flash (on top of everything)
             self.draw_damage_flash()
 
             # 8. Game over screen

@@ -1,102 +1,66 @@
-"""
-Pico 1 — GUN CONTROLLER
-========================
-Responsibilities:
-  1. Read BMI160 IMU → send AIM:yaw,pitch to laptop over USB serial
-  2. Read trigger button → send SHOOT to laptop + fire IR LED + signal robot via nRF24
-  3. Read reload button  → send RELOAD to laptop
-  4. Read joystick      → send robot movement commands to Pico 2 via nRF24
-  5. Forward IMU aim to Pico 2 via nRF24 → robot head servo tracks gun direction
-  6. Listen for HIT reply from Pico 2 via nRF24 → send HIT to laptop
+# pico1_gun.py — Gun controller firmware
+# Upload this file AND bmi160.py to the Pico root
+#
+# Wiring (from working prototype)
+# ─────────────────────────────────────────────────────
+# BMI160    SDA → GP4   SCL → GP5   VCC → 3.3V   GND → GND
+# Joystick1 X   → GP26 (steer left/right → robot movement)
+# Joystick1 Y   → GP27 (throttle fwd/back → robot movement)
+# Joystick2 Y   → GP28 (pull to fire)
+# Reload btn    → GP15  (other leg to GND, internal pull-up)
+# IR LED        → GP16 → 100Ω → GND
+# nRF24  SCK→GP2  MOSI→GP3  MISO→GP4 ... wait, GP4 is I2C SDA
+#        Use SPI1: SCK→GP10  MOSI→GP11  MISO→GP12  CSN→GP13  CE→GP14
+#
+# USB serial to laptop (115200 baud) — format understood by video streaming.py:
+#   AIM:yaw,roll     ~50 Hz  (yaw=left/right, roll=barrel up/down)
+#   SHOOT            when fire trigger deflected past threshold
+#   RELOAD           when reload button pressed
+#   HIT              when nRF24 receives hit notification from robot
+#
+# nRF24 packet to Pico 2 (7 bytes, little-endian):
+#   [steer:  int8]   -100..100
+#   [throttle:int8]  -100..100
+#   [yaw:    int16]  degrees × 10
+#   [roll:   int16]  degrees × 10
+#   [flags:  uint8]  bit0=SHOOT
 
-nRF24 packet sent to Pico 2 every ~20ms (7 bytes):
-  [joy_x: int8]  [-100..100]
-  [joy_y: int8]  [-100..100]
-  [yaw:  int16]  angle × 10  e.g. 12.5° → 125
-  [pitch:int16]  angle × 10
-  [flags: uint8] bit0=SHOOT  bit1=RELOAD
-
-nRF24 packet received from Pico 2 (1 byte):
-  [flags: uint8] bit0=HIT
-
-USB serial to laptop (115200 baud), newline-terminated:
-  AIM:yaw,pitch   ~50 Hz
-  SHOOT           on trigger
-  RELOAD          on reload button
-  HIT             when robot reports it was hit by the IR gun
-
-Wiring
-------
-BMI160        SDA→GP0  SCL→GP1  VCC→3.3V  GND→GND
-Joystick X    →GP26 (ADC0)
-Joystick Y    →GP27 (ADC1)
-Joystick btn  →GP28  (other leg to GND, internal pull-up)
-Trigger btn   →GP14  (other leg to GND, internal pull-up)
-Reload btn    →GP15  (other leg to GND, internal pull-up)
-IR LED        →GP16 → 100Ω → GND
-nRF24 SCK→GP2  MOSI→GP3  MISO→GP4  CSN→GP5  CE→GP6  VCC→3.3V  GND→GND
-"""
-
-import machine, time, struct, sys, math
-from machine import I2C, Pin, SPI, ADC
+import json
+import struct
+import sys
+from machine import Pin, I2C, ADC, SPI
+from time import sleep_ms, ticks_ms, ticks_diff
+from bmi160 import BMI160
 
 # ── PIN CONFIG ────────────────────────────────────────────────────────────────
-TRIGGER_PIN  = 14
-RELOAD_PIN   = 15
-IR_LED_PIN   = 16
-JOY_X_PIN    = 26   # ADC0
-JOY_Y_PIN    = 27   # ADC1
-JOY_BTN_PIN  = 28   # optional joystick button
-IMU_SDA      = 0
-IMU_SCL      = 1
-BMI160_ADDR  = 0x68  # change to 0x69 if SDO is pulled HIGH
-NRF_SCK, NRF_MOSI, NRF_MISO, NRF_CSN, NRF_CE = 2, 3, 4, 5, 6
+I2C_SDA  = 4
+I2C_SCL  = 5
+JOY1_X   = 26   # steer  (robot left/right)
+JOY1_Y   = 27   # throttle (robot fwd/back)
+JOY2_Y   = 28   # fire trigger
+RELOAD_PIN = 15
+IR_LED_PIN = 16
 
-# ── ADDRESSES ────────────────────────────────────────────────────────────────
-ADDR_ROBOT = b'\xD2\xF0\xF0\xF0\xF0'  # Pico 2 RX address (gun sends here)
-ADDR_GUN   = b'\xE1\xF0\xF0\xF0\xF0'  # Pico 1 RX address (robot replies here)
+# nRF24 on SPI1 (avoids conflict with I2C on GP4)
+NRF_SCK  = 10
+NRF_MOSI = 11
+NRF_MISO = 12
+NRF_CSN  = 13
+NRF_CE   = 9
 
-# ── TUNING ───────────────────────────────────────────────────────────────────
-SEND_HZ       = 50      # AIM + nRF24 update rate
-DEBOUNCE_MS   = 60
-YAW_DEADZONE  = 0.8     # deg/s — kills gyro drift
-PITCH_DEADZONE= 0.5
-JOY_DEADZONE  = 3000    # ADC units (0–65535) — ignores small stick movements
-JOY_CENTER    = 32768   # ADC midpoint for a resting joystick
+# ── nRF24 ADDRESSES ───────────────────────────────────────────────────────────
+ADDR_ROBOT = b'\xD2\xF0\xF0\xF0\xF0'
+ADDR_GUN   = b'\xE1\xF0\xF0\xF0\xF0'
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  BMI160 IMU DRIVER
-# ═══════════════════════════════════════════════════════════════════════════════
-class BMI160:
-    def __init__(self, i2c, addr=0x68):
-        self.i2c  = i2c
-        self.addr = addr
-        self._w(0x7E, 0xB6); time.sleep_ms(150)  # soft reset
-        self._w(0x7E, 0x11); time.sleep_ms(50)   # accel normal
-        self._w(0x7E, 0x15); time.sleep_ms(50)   # gyro normal
-        self._w(0x43, 0x02)                        # gyro ±500 dps
-        self._gyro_scale = 1.0 / 65.6
-
-    def _w(self, reg, val):
-        self.i2c.writeto_mem(self.addr, reg, bytes([val]))
-
-    def _r(self, reg, n):
-        return self.i2c.readfrom_mem(self.addr, reg, n)
-
-    def gyro(self):
-        gx, gy, gz = struct.unpack_from('<hhh', self._r(0x0C, 6))
-        s = self._gyro_scale
-        return gx*s, gy*s, gz*s
-
-    def accel(self):
-        ax, ay, az = struct.unpack_from('<hhh', self._r(0x12, 6))
-        s = 1.0 / 16384.0
-        return ax*s, ay*s, az*s
+# ── TUNING ────────────────────────────────────────────────────────────────────
+SEND_HZ        = 50
+FIRE_THRESHOLD = 25   # joystick deflection % to count as firing
+DEBOUNCE_MS    = 60
+JOY_DEADZONE   = 4000 # ADC units — same as working prototype
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  nRF24L01+ DRIVER  (PTX primary, brief RX window to receive HIT from robot)
+#  nRF24L01+ DRIVER
 # ═══════════════════════════════════════════════════════════════════════════════
 class NRF24:
     def __init__(self, spi, csn, ce):
@@ -113,182 +77,183 @@ class NRF24:
         self.csn.value(0); self.spi.write(bytes([0x20|reg]) + data); self.csn.value(1)
 
     def _r(self, reg):
-        self.csn.value(0); self.spi.write(bytes([reg])); v=self.spi.read(1)[0]; self.csn.value(1)
+        self.csn.value(0); self.spi.write(bytes([reg])); v = self.spi.read(1)[0]; self.csn.value(1)
         return v
 
-    def _cmd(self, cmd):
-        self.csn.value(0); self.spi.write(bytes([cmd])); self.csn.value(1)
+    def _flush(self):
+        self.csn.value(0); self.spi.write(b'\xE1'); self.csn.value(1)  # flush TX
+        self.csn.value(0); self.spi.write(b'\xE2'); self.csn.value(1)  # flush RX
 
     def _init_ptx(self):
-        time.sleep_ms(5)
+        sleep_ms(5)
         self._w(0x00, 0x0E)           # CONFIG: CRC 2B, PWR_UP, PTX
         self._w(0x01, 0x01)           # EN_AA: auto-ack pipe 0
-        self._w(0x02, 0x03)           # EN_RXADDR: pipe 0 + pipe 1
-        self._w(0x03, 0x03)           # AW: 5-byte address
-        self._w(0x04, 0x1F)           # SETUP_RETR: 500µs, 15 retries
-        self._w(0x05, 100)            # RF_CH: channel 100
-        self._w(0x06, 0x0F)           # RF_SETUP: 2Mbps, max power
-        self._wb(0x10, ADDR_ROBOT)    # TX_ADDR: send to robot
-        self._wb(0x0A, ADDR_ROBOT)    # RX_ADDR_P0: for auto-ack
-        self._wb(0x0B, ADDR_GUN)      # RX_ADDR_P1: receive HIT replies
-        self._w(0x11, 7)              # RX_PW_P0: 7-byte payload
-        self._w(0x12, 1)              # RX_PW_P1: 1-byte HIT reply
-        self._cmd(0xE1)               # flush TX FIFO
-        self._cmd(0xE2)               # flush RX FIFO
-        self._w(0x07, 0x70)           # clear interrupt flags
+        self._w(0x02, 0x03)           # enable pipe 0 + pipe 1
+        self._w(0x03, 0x03)           # 5-byte address
+        self._w(0x04, 0x1F)           # 500µs delay, 15 retries
+        self._w(0x05, 100)            # RF channel 100
+        self._w(0x06, 0x0F)           # 2Mbps, max power
+        self._wb(0x10, ADDR_ROBOT)    # TX address
+        self._wb(0x0A, ADDR_ROBOT)    # pipe 0 (auto-ack)
+        self._wb(0x0B, ADDR_GUN)      # pipe 1 (receive HIT replies)
+        self._w(0x11, 7)              # pipe 0 payload = 7 bytes
+        self._w(0x12, 1)              # pipe 1 payload = 1 byte (HIT)
+        self._flush()
+        self._w(0x07, 0x70)
 
     def send(self, data):
-        """Send up to 32-byte packet. Returns True on success."""
-        self._cmd(0xE1)               # flush TX
-        self._w(0x07, 0x70)          # clear flags
+        self._flush()
+        self._w(0x07, 0x70)
         self.csn.value(0); self.spi.write(b'\xA0' + data); self.csn.value(1)
-        self.ce.value(1); time.sleep_us(15); self.ce.value(0)
-        # Wait for TX_DS (success) or MAX_RT (fail), timeout 5ms
-        deadline = time.ticks_add(time.ticks_ms(), 5)
-        while time.ticks_diff(deadline, time.ticks_ms()) > 0:
-            status = self._r(0x07)
-            if status & 0x20: return True   # TX_DS
-            if status & 0x10: self._cmd(0xE1); return False  # MAX_RT
+        self.ce.value(1); sleep_ms(1); self.ce.value(0)
+        deadline = ticks_ms() + 5
+        while ticks_diff(deadline, ticks_ms()) > 0:
+            s = self._r(0x07)
+            if s & 0x20: return True
+            if s & 0x10: self._flush(); return False
         return False
 
     def check_hit(self):
-        """Briefly enter RX mode to check for a HIT reply from the robot."""
-        # Switch to RX
-        self._w(0x00, 0x0F)           # PRX mode
+        """Briefly listen for HIT reply from robot."""
+        self._w(0x00, 0x0F)       # PRX mode
         self.ce.value(1)
-        time.sleep_us(200)            # listen for 200µs
+        sleep_ms(1)
         hit = False
-        status = self._r(0x07)
-        if status & 0x40:             # RX_DR: data ready
-            self.csn.value(0); self.spi.write(b'\x61'); payload=self.spi.read(1)[0]; self.csn.value(1)
-            if payload & 0x01:        # bit 0 = HIT flag
-                hit = True
-            self._w(0x07, 0x40)       # clear RX_DR
-        # Switch back to PTX
+        if self._r(0x07) & 0x40:
+            self.csn.value(0); self.spi.write(b'\x61'); p = self.spi.read(1)[0]; self.csn.value(1)
+            self._w(0x07, 0x40)
+            hit = bool(p & 0x01)
         self.ce.value(0)
-        self._w(0x00, 0x0E)
+        self._w(0x00, 0x0E)       # back to PTX
         return hit
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  JOYSTICK HELPERS  (same logic as working prototype)
+# ═══════════════════════════════════════════════════════════════════════════════
+def calibrate_joysticks(samples=50):
+    print("Calibrating joysticks... hands off!")
+    sleep_ms(500)
+    s1x = s1y = s2y = 0
+    for _ in range(samples):
+        s1x += joy1_x.read_u16()
+        s1y += joy1_y.read_u16()
+        s2y += joy2_y.read_u16()
+        sleep_ms(10)
+    center = {'j1x': s1x // samples, 'j1y': s1y // samples, 'j2y': s2y // samples}
+    print(f"Centers: J1=({center['j1x']}, {center['j1y']}) J2y={center['j2y']}")
+    return center
+
+def read_joystick(adc, center, deadzone=JOY_DEADZONE):
+    raw    = adc.read_u16()
+    offset = raw - center
+    if abs(offset) < deadzone:
+        return 0
+    if offset > 0:
+        val = (offset - deadzone) / (32767 - deadzone) * 100
+    else:
+        val = (offset + deadzone) / (32767 - deadzone) * 100
+    return max(-100, min(100, int(val)))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  HARDWARE INIT
 # ═══════════════════════════════════════════════════════════════════════════════
-i2c     = I2C(0, sda=Pin(IMU_SDA), scl=Pin(IMU_SCL), freq=400_000)
-imu     = BMI160(i2c, BMI160_ADDR)
+print("\n=== GUN CONTROLLER STARTUP ===\n")
 
-joy_x   = ADC(Pin(JOY_X_PIN))
-joy_y   = ADC(Pin(JOY_Y_PIN))
-joy_btn = Pin(JOY_BTN_PIN, Pin.IN, Pin.PULL_UP)
-trigger = Pin(TRIGGER_PIN,  Pin.IN, Pin.PULL_UP)
+i2c = I2C(0, sda=Pin(I2C_SDA), scl=Pin(I2C_SCL), freq=400_000)
+devices = i2c.scan()
+print(f"I2C devices: {[hex(d) for d in devices]}")
+if 0x68 not in devices and 0x69 not in devices:
+    print("ERROR: BMI160 not found!"); raise SystemExit
+
+addr = 0x68 if 0x68 in devices else 0x69
+imu  = BMI160(i2c, addr=addr)
+imu.init()
+
+joy1_x = ADC(Pin(JOY1_X))
+joy1_y = ADC(Pin(JOY1_Y))
+joy2_y = ADC(Pin(JOY2_Y))
 reload_btn = Pin(RELOAD_PIN, Pin.IN, Pin.PULL_UP)
-ir_led  = Pin(IR_LED_PIN, Pin.OUT); ir_led.value(0)
+ir_led     = Pin(IR_LED_PIN, Pin.OUT); ir_led.value(0)
 
-spi = SPI(0, baudrate=4_000_000, sck=Pin(NRF_SCK),
+spi = SPI(1, baudrate=4_000_000, sck=Pin(NRF_SCK),
           mosi=Pin(NRF_MOSI), miso=Pin(NRF_MISO))
 nrf = NRF24(spi, Pin(NRF_CSN, Pin.OUT), Pin(NRF_CE, Pin.OUT))
+
+# Calibrate (keep gun still, hands off joysticks)
+print("\nKeep gun STILL and hands OFF joysticks!")
+sleep_ms(1000)
+imu.calibrate(samples=500, delay_ms=10)
+joy_center = calibrate_joysticks()
+
+print("\n=== READY — streaming to laptop ===")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  STATE
 # ═══════════════════════════════════════════════════════════════════════════════
-yaw, pitch = 0.0, 0.0
-last_trigger_state = 1
-last_reload_state  = 1
-last_trig_ms = last_rel_ms = last_send_ms = 0
-last_loop_ms = time.ticks_ms()
-INTERVAL_MS  = 1000 // SEND_HZ
-
-sys.stdout.write("PICO1_READY\n")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
-def read_joystick():
-    """Return (x, y) in -100..100 with deadzone applied."""
-    raw_x = joy_x.read_u16()
-    raw_y = joy_y.read_u16()
-    dx = raw_x - JOY_CENTER
-    dy = raw_y - JOY_CENTER
-    if abs(dx) < JOY_DEADZONE: dx = 0
-    if abs(dy) < JOY_DEADZONE: dy = 0
-    x = max(-100, min(100, int(dx / 327)))   # 32767/100 ≈ 327
-    y = max(-100, min(100, int(dy / 327)))
-    return x, y
+last_reload_state = 1
+last_rel_ms       = 0
+last_fire_state   = False   # was fire active last loop
+INTERVAL_MS       = 1000 // SEND_HZ
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  MAIN LOOP
 # ═══════════════════════════════════════════════════════════════════════════════
 while True:
-    now = time.ticks_ms()
-    dt  = max(0.001, time.ticks_diff(now, last_loop_ms) / 1000.0)
-    last_loop_ms = now
+    t0 = ticks_ms()
 
     # ── IMU ──────────────────────────────────────────────────────────────────
-    try:
-        gx, gy, gz = imu.gyro()
-        ax, ay, az = imu.accel()
-    except Exception:
-        time.sleep_ms(10); continue
+    yaw, roll, gz = imu.update()
 
-    if abs(gz) > YAW_DEADZONE:
-        yaw += gz * dt
-    try:
-        accel_pitch = math.degrees(math.atan2(-ax, math.sqrt(ay*ay + az*az)))
-    except:
-        accel_pitch = pitch
-    pitch = 0.02 * accel_pitch + 0.98 * (pitch + gy * dt)
-    yaw   = max(-180.0, min(180.0, yaw))
-    pitch = max(-90.0,  min(90.0,  pitch))
+    # ── JOYSTICKS ────────────────────────────────────────────────────────────
+    steer    = read_joystick(joy1_x, joy_center['j1x'])
+    throttle = read_joystick(joy1_y, joy_center['j1y'])
+    fire_raw = read_joystick(joy2_y, joy_center['j2y'])
+    fire_now = abs(fire_raw) > FIRE_THRESHOLD
 
-    # ── BUTTONS ──────────────────────────────────────────────────────────────
-    shoot_flag   = False
-    reload_flag  = False
+    # ── SHOOT (rising edge of fire trigger) ──────────────────────────────────
+    shoot_flag = False
+    if fire_now and not last_fire_state:
+        sys.stdout.write("SHOOT\n")
+        ir_led.value(1); sleep_ms(25); ir_led.value(0)
+        shoot_flag = True
+    last_fire_state = fire_now
 
-    trig = trigger.value()
-    if trig == 0 and last_trigger_state == 1:
-        if time.ticks_diff(now, last_trig_ms) > DEBOUNCE_MS:
-            sys.stdout.write("SHOOT\n")
-            ir_led.value(1); time.sleep_ms(25); ir_led.value(0)
-            shoot_flag = True
-            last_trig_ms = now
-    last_trigger_state = trig
-
+    # ── RELOAD BUTTON ────────────────────────────────────────────────────────
+    reload_flag = False
     rel = reload_btn.value()
     if rel == 0 and last_reload_state == 1:
-        if time.ticks_diff(now, last_rel_ms) > DEBOUNCE_MS:
+        if ticks_diff(ticks_ms(), last_rel_ms) > DEBOUNCE_MS:
             sys.stdout.write("RELOAD\n")
-            # Hold reload + trigger → re-zero aim
-            if trigger.value() == 0:
-                yaw = 0.0; pitch = 0.0
+            # Hold reload + fire → re-zero yaw
+            if fire_now:
+                imu.reset_yaw()
                 sys.stdout.write("AIM:0.0,0.0\n")
             reload_flag = True
-            last_rel_ms = now
+            last_rel_ms = ticks_ms()
     last_reload_state = rel
 
-    # ── SEND TO LAPTOP + ROBOT ────────────────────────────────────────────────
-    if time.ticks_diff(now, last_send_ms) >= INTERVAL_MS:
-        # USB serial → laptop
-        sys.stdout.write("AIM:{:.1f},{:.1f}\n".format(yaw, pitch))
+    # ── SEND TO LAPTOP ───────────────────────────────────────────────────────
+    sys.stdout.write("AIM:{:.1f},{:.1f}\n".format(yaw, roll))
 
-        # nRF24 → robot (joy + aim + flags)
-        jx, jy = read_joystick()
-        flags  = (0x01 if shoot_flag else 0) | (0x02 if reload_flag else 0)
-        packet = struct.pack('<bbhhB',
-                             jx, jy,
-                             int(yaw * 10),
-                             int(pitch * 10),
-                             flags)
-        nrf.send(packet)
+    # ── SEND TO ROBOT (nRF24) ─────────────────────────────────────────────────
+    flags  = 0x01 if shoot_flag else 0
+    flags |= 0x02 if reload_flag else 0
+    packet = struct.pack('<bbhhB',
+                         steer, throttle,
+                         int(yaw  * 10),
+                         int(roll * 10),
+                         flags)
+    nrf.send(packet)
 
-        # Check for HIT reply from robot (brief RX window after TX)
-        if nrf.check_hit():
-            sys.stdout.write("HIT\n")
+    # ── CHECK FOR HIT REPLY FROM ROBOT ───────────────────────────────────────
+    if nrf.check_hit():
+        sys.stdout.write("HIT\n")
 
-        last_send_ms = now
-
-    # Sleep remainder
-    elapsed = time.ticks_diff(time.ticks_ms(), now)
+    # ── MAINTAIN 50 Hz ───────────────────────────────────────────────────────
+    elapsed = ticks_diff(ticks_ms(), t0)
     rem = INTERVAL_MS - elapsed
     if rem > 0:
-        time.sleep_ms(rem)
+        sleep_ms(rem)
