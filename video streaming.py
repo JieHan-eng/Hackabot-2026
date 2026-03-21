@@ -245,7 +245,8 @@ class NPC:
         self.display_health = float(self.MAX_HEALTH)   # smoothed health for bar rendering
         self.last_seen      = time.time()
         self.hit_flash      = 0.0   # seconds of hit-flash remaining
-        self.kill_time      = None  # set when health → 0
+        self.dead_until     = None  # timestamp when this NPC may respawn (None = alive)
+        self.kill_icon_until = None # timestamp until skull icon is shown
         self.engaged        = False # True once this NPC has been hit at least once
 
 
@@ -509,7 +510,6 @@ class FPSGame:
 
         # NPC tracking
         self.npcs: list[NPC] = []
-        self._dead_zones: list = []  # [(x1,y1,x2,y2, expiry_time)] — block respawn in killed region
         self._active_url = ""
 
         # Kill feed
@@ -521,8 +521,12 @@ class FPSGame:
         self._set_music("menu")
 
         # ── Pre-generated visual overlays ──
-        self._vignette  = self._make_vignette()
-        self._scanlines = self._make_scanlines()
+        self._vignette     = self._make_vignette()
+        self._scanlines    = self._make_scanlines()
+        self._grain_frames = self._make_grain_frames()
+        self._grain_idx    = 0
+        self._grain_tick   = 0.0
+        self._nv_mask      = self._make_nv_mask()
 
         # Detection worker (runs in background thread)
         self._det_worker = None
@@ -605,13 +609,15 @@ class FPSGame:
             print(f"[!] snd_hit_tink generation failed: {e}")
             self.snd_hit_tink = None
 
-        # ── snd_reload: real revolver reload WAV (tries underscore then space) ──
+        # ── snd_reload: revolver reload sound (tries mp3, then wav variants) ──
         try:
-            _rp = os.path.join(_ASSETS_DIR, "revolver_reload.wav")
+            _rp = os.path.join(_ASSETS_DIR, "revolver_reload.mp3")
+            if not os.path.exists(_rp):
+                _rp = os.path.join(_ASSETS_DIR, "revolver_reload.wav")
             if not os.path.exists(_rp):
                 _rp = os.path.join(_ASSETS_DIR, "revolver reload.wav")
             if not os.path.exists(_rp):
-                raise FileNotFoundError(f"Neither 'revolver_reload.wav' nor 'revolver reload.wav' found in {_ASSETS_DIR}")
+                raise FileNotFoundError(f"No reload sound found in {_ASSETS_DIR}")
             self.snd_reload = self._load_wav(_rp, amplify=2.5)
             print(f"[OK] Reload sound loaded: {os.path.basename(_rp)}")
         except Exception as e:
@@ -706,12 +712,289 @@ class FPSGame:
 
     @staticmethod
     def _make_scanlines() -> pygame.Surface:
-        """Subtle horizontal scanlines, pre-rendered once."""
+        """CRT-style horizontal scanlines, pre-rendered once."""
         surf = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
         surf.fill((0, 0, 0, 0))
-        for y in range(0, WINDOW_H, 3):
-            pygame.draw.line(surf, (0, 0, 0, 18), (0, y), (WINDOW_W - 1, y), 1)
+        for y in range(0, WINDOW_H, 4):
+            pygame.draw.line(surf, (0, 0, 0, 30), (0, y), (WINDOW_W - 1, y), 1)
+        for y in range(0, WINDOW_H, 16):
+            pygame.draw.line(surf, (0, 0, 0, 12), (0, y), (WINDOW_W - 1, y), 2)
         return surf
+
+    @staticmethod
+    def _make_grain_frames(n: int = 8) -> list:
+        """Pre-generate n random noise surfaces for film grain cycling."""
+        frames = []
+        for _ in range(n):
+            surf = pygame.Surface((WINDOW_W, WINDOW_H))
+            arr  = pygame.surfarray.pixels3d(surf)
+            arr[:] = np.random.randint(80, 170, (WINDOW_W, WINDOW_H, 3), dtype=np.uint8)
+            del arr
+            surf.set_alpha(22)
+            frames.append(surf)
+        return frames
+
+    @staticmethod
+    def _make_nv_mask() -> pygame.Surface:
+        """Night-vision goggle scope mask — black outside a central oval."""
+        surf = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+        surf.fill((0, 0, 0, 255))
+        # Cut out ellipse in the center
+        rx, ry = int(WINDOW_W * 0.38), int(WINDOW_H * 0.48)
+        cx, cy = WINDOW_W // 2, WINDOW_H // 2
+        # Soft edge: draw concentric shrinking ellipses from black→transparent
+        for i in range(40):
+            a = int(255 * (i / 40))   # alpha goes 0→255 outward; we build inward
+            er = max(1, rx - i * (rx // 40))
+            ep = max(1, ry - i * (ry // 40))
+            pygame.draw.ellipse(surf, (0, 0, 0, 255 - a),
+                                (cx - er, cy - ep, er * 2, ep * 2), 0)
+        return surf
+
+    # ── grain / particles / overlays ─────────────────────────
+
+    def _draw_grain(self, dt: float):
+        """Cycle through pre-baked noise frames for film-grain texture."""
+        self._grain_tick += dt
+        if self._grain_tick > 0.08:
+            self._grain_tick = 0.0
+            self._grain_idx = (self._grain_idx + 1) % len(self._grain_frames)
+        self.screen.blit(self._grain_frames[self._grain_idx], (0, 0))
+
+    def _update_and_draw_particles(self, dt: float, map_idx: int):
+        """Spawn + update + draw ambient menu particles themed to the current map."""
+        f = MAP_DATA[map_idx]["filter"] if map_idx >= 0 else "nightops"
+        pc = MAP_DATA[map_idx]["particle"] if map_idx >= 0 else (60, 180, 100)
+
+        # Spawn rate and behaviour per map
+        if f == "arctic":        # snowflakes
+            if random.random() < 0.4:
+                self._particles.append([
+                    random.randint(0, WINDOW_W), -4,
+                    random.uniform(-0.6, 0.6), random.uniform(0.6, 1.4),
+                    random.uniform(1.5, 3.5), random.uniform(1.5, 3.5),
+                    random.randint(2, 4), *pc])
+        elif f == "warzone":     # rising embers
+            if random.random() < 0.35:
+                self._particles.append([
+                    random.randint(0, WINDOW_W), WINDOW_H + 4,
+                    random.uniform(-0.5, 0.5), random.uniform(-1.8, -0.8),
+                    random.uniform(1.0, 2.5), random.uniform(1.0, 2.5),
+                    random.randint(2, 3), *pc])
+        elif f == "jungle":      # falling rain streaks
+            if random.random() < 0.7:
+                self._particles.append([
+                    random.randint(0, WINDOW_W), -8,
+                    random.uniform(0.3, 0.8), random.uniform(3.0, 5.0),
+                    random.uniform(0.6, 1.2), random.uniform(0.6, 1.2),
+                    1, *pc])
+        elif f == "nightops":    # slow drifting specks
+            if random.random() < 0.15:
+                self._particles.append([
+                    random.randint(0, WINDOW_W), random.randint(0, WINDOW_H),
+                    random.uniform(-0.2, 0.2), random.uniform(-0.4, -0.1),
+                    random.uniform(3.0, 6.0), random.uniform(3.0, 6.0),
+                    random.randint(1, 2), *pc])
+        else:                    # cyberpunk — vertical data rain
+            if random.random() < 0.5:
+                self._particles.append([
+                    random.randint(0, WINDOW_W), -10,
+                    0.0, random.uniform(4.0, 9.0),
+                    random.uniform(0.3, 0.8), random.uniform(0.3, 0.8),
+                    1, *pc])
+
+        # Update + draw
+        alive = []
+        for p in self._particles:
+            p[0] += p[2] * dt * 60
+            p[1] += p[3] * dt * 60
+            p[4] -= dt
+            if p[4] <= 0:
+                continue
+            alpha = min(255, max(0, int(180 * (p[4] / p[5]))))
+            r, g, b = p[7], p[8], p[9]
+            size = p[6]
+            if f == "jungle":   # draw as short line streak
+                pygame.draw.line(self.screen, (r, g, b),
+                                 (int(p[0]), int(p[1])),
+                                 (int(p[0] + p[2]*4), int(p[1] + p[3]*4)), 1)
+            elif f == "cyberpunk":  # single bright pixel
+                col = (min(255, r + 80), min(255, g + 80), min(255, b + 80))
+                self.screen.set_at((int(p[0]) % WINDOW_W, int(p[1]) % WINDOW_H), col)
+            else:
+                surf = pygame.Surface((size*2, size*2), pygame.SRCALPHA)
+                pygame.draw.circle(surf, (r, g, b, alpha), (size, size), size)
+                self.screen.blit(surf, (int(p[0]) - size, int(p[1]) - size))
+            alive.append(p)
+        self._particles = alive[:300]   # cap list size
+
+    def _draw_map_terrain(self, rx: int, ry: int, rw: int, rh: int,
+                          map_filter: str, accent: tuple):
+        """Draw a procedural map-themed terrain silhouette.
+        Uses a seeded RNG so the layout is stable across frames."""
+        rng    = random.Random(map_filter)   # deterministic per map
+        base_y = ry + rh
+        col    = (int(accent[0]*0.20), int(accent[1]*0.20), int(accent[2]*0.20))
+        col2   = (int(accent[0]*0.10), int(accent[1]*0.10), int(accent[2]*0.10))
+
+        if map_filter == "arctic":
+            pts = [(rx, base_y)]
+            x = rx
+            while x < rx + rw:
+                pts.append((x, base_y - rng.randint(30, 160)))
+                x += rng.randint(30, 80)
+            pts.append((rx + rw, base_y))
+            pygame.draw.polygon(self.screen, col, pts)
+            for i in range(1, len(pts) - 1):
+                px, py = pts[i]
+                if py < base_y - 80:
+                    pygame.draw.polygon(self.screen, (200, 220, 255),
+                                        [(px-12, py+25), (px, py), (px+12, py+25)])
+
+        elif map_filter == "warzone":
+            x = rx
+            while x < rx + rw:
+                bw = rng.randint(25, 65)
+                bh = rng.randint(40, 180)
+                notch = rng.randint(0, 2)
+                pts = [(x, base_y), (x, base_y - bh)]
+                if notch:
+                    pts += [(x + bw//3, base_y - bh + rng.randint(8, 20)),
+                            (x + 2*bw//3, base_y - bh)]
+                pts += [(x + bw, base_y - bh + rng.randint(0, 15)), (x + bw, base_y)]
+                pygame.draw.polygon(self.screen, col, pts)
+                for wy in range(int(base_y - bh + 12), base_y - 10, 18):
+                    if rng.random() > 0.5:
+                        pygame.draw.rect(self.screen,
+                                         (int(accent[0]*0.4), int(accent[1]*0.4), 0),
+                                         (x + 6, wy, 6, 8))
+                x += bw + rng.randint(2, 10)
+
+        elif map_filter == "jungle":
+            x = rx
+            while x < rx + rw:
+                tx = x + rng.randint(-10, 10)
+                tr = rng.randint(25, 60)
+                ty = base_y - rng.randint(60, 140)
+                pygame.draw.circle(self.screen, col, (tx, ty), tr)
+                pygame.draw.circle(self.screen, col2, (tx - 8, ty + 10), max(1, tr - 10))
+                pygame.draw.rect(self.screen, col2, (tx - 4, ty + tr - 10, 8, 50))
+                x += rng.randint(40, 80)
+            pygame.draw.rect(self.screen, col2, (rx, base_y - 15, rw, 15))
+
+        elif map_filter == "nightops":
+            pts = [(rx, base_y)]
+            steps = rw // 8
+            for i in range(steps + 1):
+                wave = math.sin(i * 0.4) * 35 + math.sin(i * 0.9) * 15
+                pts.append((rx + i * 8, base_y - 40 - int(wave)))
+            pts.append((rx + rw, base_y))
+            pygame.draw.polygon(self.screen, col, pts)
+            for _ in range(6):
+                tx = rng.randint(rx + 20, rx + rw - 20)
+                th = rng.randint(40, 80)
+                ty_base = base_y - 38
+                for level in range(3):
+                    lw = th // 2 - level * 8
+                    ly = ty_base - th + level * (th // 3)
+                    pygame.draw.polygon(self.screen, col2,
+                                        [(tx, ly), (tx-lw, ly+th//3), (tx+lw, ly+th//3)])
+
+        else:  # cyberpunk
+            x = rx
+            while x < rx + rw:
+                bw = rng.randint(30, 70)
+                bh = rng.randint(80, 220)
+                pygame.draw.rect(self.screen, col, (x, base_y - bh, bw, bh))
+                ax = x + bw // 2
+                pygame.draw.line(self.screen, col2,
+                                 (ax, base_y - bh), (ax, base_y - bh - 30), 2)
+                for wy in range(int(base_y - bh + 8), base_y - 4, 12):
+                    pygame.draw.rect(self.screen,
+                                     (0, int(accent[1]*0.5), int(accent[2]*0.5)),
+                                     (x + 4, wy, bw - 8, 4))
+                x += bw + rng.randint(4, 16)
+
+    def draw_map_overlay(self, dt: float):
+        """Draw per-map in-game atmosphere overlay on top of the camera feed."""
+        f   = MAP_DATA[self.current_map]["filter"]
+        acc = MAP_DATA[self.current_map]["accent"]
+        now = time.time()
+
+        if f == "arctic":
+            # White-fog vignette at edges (blizzard)
+            fog = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+            for i in range(30):
+                a = int(90 * (1 - i / 30))
+                m = i * min(WINDOW_W, WINDOW_H) // 60
+                pygame.draw.rect(fog, (220, 230, 255, a),
+                                 (m, m, WINDOW_W - 2*m, WINDOW_H - 2*m), 4)
+            self.screen.blit(fog, (0, 0))
+            # Pillar-box side bars (narrow horizontal FOV feel)
+            bar_w = int(WINDOW_W * 0.07)
+            bar = pygame.Surface((bar_w, WINDOW_H), pygame.SRCALPHA)
+            bar.fill((180, 200, 240, 90))
+            self.screen.blit(bar, (0, 0))
+            self.screen.blit(bar, (WINDOW_W - bar_w, 0))
+            # Drifting snow flecks over the camera feed
+            self._update_and_draw_particles(dt, self.current_map)
+
+        elif f == "warzone":
+            # Orange smoke haze at edges
+            haze = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+            for i in range(20):
+                a = int(55 * (1 - i / 20))
+                m = i * min(WINDOW_W, WINDOW_H) // 40
+                pygame.draw.rect(haze, (40, 20, 5, a),
+                                 (m, m, WINDOW_W - 2*m, WINDOW_H - 2*m), 6)
+            self.screen.blit(haze, (0, 0))
+            # Subtle animated dust streak
+            self._update_and_draw_particles(dt, self.current_map)
+
+        elif f == "jungle":
+            # Green foliage vignette — lush corner darkening
+            fog = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+            for i in range(25):
+                a = int(70 * (1 - i / 25))
+                m = i * min(WINDOW_W, WINDOW_H) // 50
+                pygame.draw.rect(fog, (5, 30, 8, a),
+                                 (m, m, WINDOW_W - 2*m, WINDOW_H - 2*m), 5)
+            self.screen.blit(fog, (0, 0))
+            # Rain streaks
+            self._update_and_draw_particles(dt, self.current_map)
+
+        elif f == "nightops":
+            # Night-vision goggle scope mask (black outside oval)
+            self.screen.blit(self._nv_mask, (0, 0))
+            # Green CRT scanlines over the NV view
+            nv_scan = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+            for y in range(0, WINDOW_H, 3):
+                pygame.draw.line(nv_scan, (0, 60, 0, 18), (0, y), (WINDOW_W, y))
+            self.screen.blit(nv_scan, (0, 0))
+            # Phosphor glow ring around scope edge
+            ring = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+            rx, ry_ = int(WINDOW_W * 0.38), int(WINDOW_H * 0.48)
+            cx, cy_ = WINDOW_W // 2, WINDOW_H // 2
+            for t in range(3):
+                pygame.draw.ellipse(ring, (0, 180, 60, 30 - t*8),
+                                    (cx - rx - t*3, cy_ - ry_ - t*3,
+                                     (rx + t*3)*2, (ry_ + t*3)*2), 2)
+            self.screen.blit(ring, (0, 0))
+
+        else:  # cyberpunk
+            # Glitch horizontal bands (random, brief)
+            if random.random() < 0.04:
+                glitch = pygame.Surface((WINDOW_W, random.randint(2, 8)), pygame.SRCALPHA)
+                glitch.fill((0, 210, 255, 40))
+                self.screen.blit(glitch, (0, random.randint(0, WINDOW_H)))
+            # Cyan edge fringe
+            fringe = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+            for i in range(15):
+                a = int(50 * (1 - i / 15))
+                m = i * min(WINDOW_W, WINDOW_H) // 30
+                pygame.draw.rect(fringe, (0, 40, 60, a),
+                                 (m, m, WINDOW_W - 2*m, WINDOW_H - 2*m), 4)
+            self.screen.blit(fringe, (0, 0))
 
     # ── serial ───────────────────────────────────────────────
 
@@ -872,21 +1155,22 @@ class FPSGame:
 
     def _update_npc_tracking(self, new_boxes: list):
         """Match incoming detection boxes to existing NPC objects."""
-        NPC_TIMEOUT = 0.4   # drop NPC if not seen for this many seconds (short = no ghost duplicates)
-        MATCH_DIST  = 250   # max pixel distance for centre-based fallback match
-        KILL_LINGER = 0.8   # seconds to show kill flash before removing NPC
+        NPC_TIMEOUT = 0.4   # drop live NPC if not seen for this many seconds
 
         now = time.time()
 
-        # Expire dead zones
-        self._dead_zones = [dz for dz in self._dead_zones if dz[4] > now]
+        # Respawn dead NPCs whose cooldown has expired
+        for npc in self.npcs:
+            if npc.dead_until is not None and now >= npc.dead_until:
+                npc.health         = npc.MAX_HEALTH
+                npc.display_health = float(npc.MAX_HEALTH)
+                npc.dead_until     = None
+                npc.kill_icon_until = None
+                npc.engaged        = False
 
-        # Remove NPCs that have been dead long enough
+        # Drop live NPCs not seen recently; keep dead NPCs until cooldown expires
         self.npcs = [n for n in self.npcs
-                     if n.kill_time is None or (now - n.kill_time) < KILL_LINGER]
-        # Remove NPCs not seen recently (only if still alive)
-        self.npcs = [n for n in self.npcs
-                     if n.health <= 0 or (now - n.last_seen) < NPC_TIMEOUT]
+                     if n.dead_until is not None or (now - n.last_seen) < NPC_TIMEOUT]
 
         def iou(a, b):
             ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
@@ -896,55 +1180,74 @@ class FPSGame:
             ub = (b[2]-b[0])*(b[3]-b[1])
             return inter / (ua + ub - inter) if (ua + ub - inter) > 0 else 0
 
-        # Match new boxes to existing NPCs —
-        # prefer IoU overlap (handles large position jumps when camera/person moves),
-        # fall back to centre distance for nearby non-overlapping boxes.
-        matched = set()
-        for (x1, y1, x2, y2) in new_boxes:
-            cx = (x1 + x2) // 2
-            cy = (y1 + y2) // 2
+        def size_ratio(a, b):
+            wa = max(1, a[2] - a[0])
+            wb = max(1, b[2] - b[0])
+            return max(wa, wb) / min(wa, wb)
+
+        # ── Greedy IoU-priority assignment ─────────────────────────────────
+        # Include ALL NPCs (live + dead) so dead ones keep their tracked position
+        all_indices = list(range(len(self.npcs)))
+        det_boxes   = list(new_boxes)
+
+        scores = []
+        for di, (x1, y1, x2, y2) in enumerate(det_boxes):
             new_box = (x1, y1, x2, y2)
-
-            best_idx   = None
-            best_score = -1   # higher = better match
-            for i, npc in enumerate(self.npcs):
-                if i in matched or npc.health <= 0:
-                    continue
+            for ni in all_indices:
+                npc  = self.npcs[ni]
                 nbox = tuple(int(v) for v in npc.display_box)
-                overlap = iou(new_box, nbox)
-                if overlap > 0:
-                    # Any overlap counts as a match; prefer highest IoU
-                    if overlap > best_score:
-                        best_score = overlap
-                        best_idx   = i
-                else:
-                    # No overlap — use centre distance as fallback
-                    nx1, ny1, nx2, ny2 = npc.box
-                    d = math.hypot(cx - (nx1+nx2)//2, cy - (ny1+ny2)//2)
-                    score = 1.0 - d / MATCH_DIST   # 0..1, higher = closer
-                    if d < MATCH_DIST and score > best_score:
-                        best_score = score
-                        best_idx   = i
+                ov   = iou(new_box, nbox)
+                if ov > 0.15 and size_ratio(new_box, nbox) < 2.5:
+                    scores.append((ov, di, ni))
 
+        scores.sort(reverse=True)
+        matched_det = set()
+        matched_npc = set()
+        for ov, di, ni in scores:
+            if di in matched_det or ni in matched_npc:
+                continue
+            x1, y1, x2, y2 = det_boxes[di]
+            self.npcs[ni].box       = (x1, y1, x2, y2)
+            self.npcs[ni].last_seen = now
+            matched_det.add(di)
+            matched_npc.add(ni)
+
+        # ── Tight distance fallback (only for live NPCs) ────────────────────
+        live_indices = [i for i in all_indices if self.npcs[i].dead_until is None]
+        for di, (x1, y1, x2, y2) in enumerate(det_boxes):
+            if di in matched_det:
+                continue
+            new_box = (x1, y1, x2, y2)
+            dcx = (x1 + x2) // 2
+            dcy = (y1 + y2) // 2
+            dw  = x2 - x1
+            best_idx, best_d = None, float('inf')
+            for ni in live_indices:
+                if ni in matched_npc:
+                    continue
+                npc = self.npcs[ni]
+                nx1, ny1, nx2, ny2 = npc.box
+                d = math.hypot(dcx - (nx1+nx2)//2, dcy - (ny1+ny2)//2)
+                if d < dw and d < best_d and size_ratio(new_box, (nx1,ny1,nx2,ny2)) < 2.0:
+                    best_d, best_idx = d, ni
             if best_idx is not None:
                 self.npcs[best_idx].box       = (x1, y1, x2, y2)
                 self.npcs[best_idx].last_seen = now
-                matched.add(best_idx)
-            else:
-                # Don't spawn if another live NPC overlaps, or box centre is near a dead zone
-                new_cx = (x1 + x2) // 2
-                new_cy = (y1 + y2) // 2
-                new_w  = x2 - x1
-                expand = max(60, int(new_w * 0.5))
-                in_dead = any(
-                    dz[0] - expand <= new_cx <= dz[2] + expand and
-                    dz[1] - expand <= new_cy <= dz[3] + expand
-                    for dz in self._dead_zones
-                )
-                no_overlap = not any(iou(new_box, tuple(int(v) for v in n.display_box)) > 0.1
-                                     for n in self.npcs)
-                if no_overlap and not in_dead and len(self.npcs) < 8:
-                    self.npcs.append(NPC(x1, y1, x2, y2))
+                matched_det.add(di)
+                matched_npc.add(best_idx)
+
+        # ── Spawn new NPC for unmatched detections ──────────────────────────
+        for di, (x1, y1, x2, y2) in enumerate(det_boxes):
+            if di in matched_det:
+                continue
+            new_box = (x1, y1, x2, y2)
+            # Block spawn if this detection overlaps any existing NPC (live or dead)
+            overlaps = any(
+                iou(new_box, tuple(int(v) for v in n.display_box)) > 0.1
+                for n in self.npcs
+            )
+            if not overlaps and len(self.npcs) < 8:
+                self.npcs.append(NPC(x1, y1, x2, y2))
 
     @staticmethod
     def _shrink_box(box, x_factor, y_factor=None):
@@ -959,11 +1262,13 @@ class FPSGame:
     def _get_targeted_npc(self):
         """Return the live NPC whose shrunk display box contains the crosshair, or None."""
         cx, cy = int(self.ch_x), int(self.ch_y)
+        now = time.time()
         for npc in self.npcs:
-            if npc.health <= 0:
+            if npc.health <= 0 or (npc.dead_until is not None and npc.dead_until > now):
                 continue
+            bx1, by1, bx2, by2 = (int(v) for v in npc.display_box)
             x1, y1, x2, y2 = self._shrink_box(
-                tuple(int(v) for v in npc.display_box), HIT_SHRINK_X, HIT_SHRINK_Y)
+                (bx1, by1, bx2, by2), HIT_SHRINK_X, HIT_SHRINK_Y)
             if x1 <= cx <= x2 and y1 <= cy <= y2:
                 return npc
         return None
@@ -1009,17 +1314,13 @@ class FPSGame:
             self.score += 50
 
             if targeted.health <= 0:
-                targeted.kill_time = time.time()
+                now = time.time()
+                targeted.dead_until      = now + 6.0   # 6 s respawn cooldown
+                targeted.kill_icon_until = now + 1.5   # skull visible for 1.5 s
                 self.kills += 1
                 self.score += 150   # kill bonus
                 self._play(self.snd_hit)
                 self.kill_feed.append([time.time(), "HOSTILE ELIMINATED"])
-                # Block this region for 6 seconds and show death icon there
-                x1, y1, x2, y2 = targeted.box
-                cx = (x1 + x2) // 2
-                cy = (y1 + y2) // 2
-                icon_until = time.time() + 1.5   # skull visible for 1.5 s then hides
-                self._dead_zones.append((x1, y1, x2, y2, time.time() + 6.0, cx, cy, icon_until))
         else:
             # ── Miss — standard gunshot only ──
             self._play(self.snd_shoot)
@@ -1364,13 +1665,17 @@ class FPSGame:
             pygame.draw.rect(self.screen, bar_col,
                              (x1, bar_y, max(1, int(w * pct)), bar_h))
 
-        # ── Death icons + respawn countdown for each dead zone ──────────────
+        # ── Death icons + respawn countdown — drawn at the NPC's tracked position ──
         now = time.time()
-        for dz in self._dead_zones:
-            x1, y1, x2, _y2, exp, cx, cy, icon_until = dz
-            if now > icon_until:
-                continue   # icon expired — respawn block still active, just don't draw
-            remaining = exp - now
+        for npc in self.npcs:
+            if npc.dead_until is None or npc.dead_until <= now:
+                continue
+            if npc.kill_icon_until is None or now > npc.kill_icon_until:
+                continue   # icon window expired — cooldown still active, just don't draw
+            bx1, by1, bx2, by2 = (int(v) for v in npc.display_box)
+            cx = (bx1 + bx2) // 2
+            cy = (by1 + by2) // 2
+            remaining = npc.dead_until - now
             total_cd  = 6.0
 
             self._draw_skull(cx, cy)
@@ -1384,10 +1689,8 @@ class FPSGame:
                 pygame.draw.arc(self.screen, (220, 30, 30), rect,
                                 math.radians(90),
                                 math.radians(90 + arc_deg), 3)
-            # Dark ring background
             pygame.draw.circle(self.screen, (0, 0, 0), (cx, cy), ring_r, 1)
 
-            # Countdown number below icon
             cd_txt = self.font_small.render(f"{remaining:.1f}s", True, (220, 30, 30))
             self.screen.blit(cd_txt, cd_txt.get_rect(center=(cx, cy + ring_r + 12)))
 
@@ -1398,6 +1701,12 @@ class FPSGame:
         m = min(self.current_map, len(self._MAP_HP_COLOURS) - 1)
         col_hi, col_mid, col_lo = self._MAP_HP_COLOURS[m][:3]
         col = col_hi if pct > 0.5 else col_mid if pct > 0.25 else col_lo
+
+        # Dark panel background
+        panel = pygame.Surface((210, 68), pygame.SRCALPHA)
+        panel.fill((0, 0, 0, 130))
+        self.screen.blit(panel, (x - 8, y - 58))
+        pygame.draw.line(self.screen, col, (x - 8, y - 58), (x + 202, y - 58), 1)
 
         # Large HP number
         big = self.font_big.render(str(self.health), True, col)
@@ -1415,6 +1724,14 @@ class FPSGame:
 
     def draw_ammo(self):
         """CS:GO-style: large ammo number / reserve + reload bar."""
+        # Dark panel background (bottom-right)
+        panel = pygame.Surface((190, 68), pygame.SRCALPHA)
+        panel.fill((0, 0, 0, 130))
+        self.screen.blit(panel, (WINDOW_W - 198, WINDOW_H - 76))
+        m = min(self.current_map, len(self._MAP_HP_COLOURS) - 1)
+        acc = self._MAP_HP_COLOURS[m][0]
+        pygame.draw.line(self.screen, acc,
+                         (WINDOW_W - 198, WINDOW_H - 76), (WINDOW_W - 8, WINDOW_H - 76), 1)
         if self.reloading:
             progress = min(1.0, (time.time() - self.reload_start) / self.reload_time)
             # RELOADING label
@@ -1508,8 +1825,11 @@ class FPSGame:
             self.screen = pygame.display.set_mode(
                 (WINDOW_W, WINDOW_H), pygame.FULLSCREEN)
         # Regenerate resolution-dependent overlays
-        self._vignette  = self._make_vignette()
-        self._scanlines = self._make_scanlines()
+        self._vignette     = self._make_vignette()
+        self._scanlines    = self._make_scanlines()
+        self._grain_frames = self._make_grain_frames()
+        self._nv_mask      = self._make_nv_mask()
+        self._particles.clear()
         # Re-centre crosshair
         self.ch_x = float(WINDOW_W // 2)
         self.ch_y = float(WINDOW_H // 2)
@@ -1742,18 +2062,26 @@ class FPSGame:
 
     # ── menu background ──────────────────────────────────────
 
-    def _draw_menu_bg(self, map_idx: int = -1):
-        """Dark FPS lobby background with map-tinted atmosphere."""
+    def _draw_menu_bg(self, map_idx: int = -1, dt: float = 0.0):
+        """Dark FPS lobby background with animated atmosphere."""
         bg = MAP_DATA[map_idx]["bg"] if map_idx >= 0 else (6, 8, 14)
         self.screen.fill(bg)
 
-        # Subtle hex/grid overlay
         accent = MAP_DATA[map_idx]["accent"] if map_idx >= 0 else (0, 180, 100)
+
+        # Animated diagonal slash lines (scrolling slowly)
         ga = (int(accent[0]*0.06), int(accent[1]*0.06), int(accent[2]*0.06))
-        for x in range(0, WINDOW_W + 60, 60):
-            pygame.draw.line(self.screen, ga, (x, 0), (x, WINDOW_H))
-        for y in range(0, WINDOW_H + 60, 60):
-            pygame.draw.line(self.screen, ga, (0, y), (WINDOW_W, y))
+        scroll = int(self._title_timer * 18) % 90
+        for d in range(-WINDOW_H, WINDOW_W + WINDOW_H, 90):
+            x1 = d + scroll
+            pygame.draw.line(self.screen, ga, (x1, 0), (x1 + WINDOW_H, WINDOW_H))
+
+        # Film grain
+        self._draw_grain(dt)
+
+        # Ambient particles
+        if map_idx >= 0:
+            self._update_and_draw_particles(dt, map_idx)
 
         # Top bar
         pygame.draw.rect(self.screen, (0, 0, 0), (0, 0, WINDOW_W, 64))
@@ -1782,7 +2110,7 @@ class FPSGame:
     def _draw_connecting_screen(self, dt: float):
         """Blocks at launch until the phone camera is live."""
         self._title_timer += dt
-        self._draw_menu_bg()
+        self._draw_menu_bg(dt=dt)
 
         # Spinner dots
         dots = "." * (int(self._title_timer * 2) % 4)
@@ -1813,7 +2141,7 @@ class FPSGame:
 
     def _draw_title_screen(self, dt: float):
         self._title_timer += dt
-        self._draw_menu_bg()
+        self._draw_menu_bg(dt=dt)
 
         # Animated scanline sweep
         sweep_y = int((self._title_timer * 120) % WINDOW_H)
@@ -1852,7 +2180,7 @@ class FPSGame:
     def _draw_map_select_screen(self, dt: float):
         self._title_timer += dt
         m = self.current_map
-        self._draw_menu_bg(m)
+        self._draw_menu_bg(m, dt)
 
         content_top = 74
         content_bot = WINDOW_H - 40
@@ -1913,7 +2241,7 @@ class FPSGame:
         accent = md["accent"]
         bg_col = md["bg"]
 
-        # Panel background — gradient effect via stacked rects
+        # Panel background — gradient
         for i in range(right_h):
             alpha = i / right_h
             r = int(bg_col[0] * (1 - alpha * 0.6))
@@ -1921,6 +2249,11 @@ class FPSGame:
             b = int(bg_col[2] * (1 - alpha * 0.6))
             pygame.draw.line(self.screen, (r, g, b),
                              (right_x, right_y + i), (right_x + right_w, right_y + i))
+
+        # Terrain silhouette at the bottom of the right panel
+        terrain_h = int(right_h * 0.42)
+        self._draw_map_terrain(right_x, right_y + right_h - terrain_h,
+                               right_w, terrain_h, md["filter"], accent)
 
         # Animated corner brackets
         t = self._title_timer
@@ -1986,7 +2319,7 @@ class FPSGame:
 
     def _draw_calibrating_screen(self, dt: float):
         self._calib_timer += dt
-        self._draw_menu_bg(self.current_map)
+        self._draw_menu_bg(self.current_map, dt)
 
         accent = MAP_DATA[self.current_map]["accent"]
         cx = WINDOW_W // 2
@@ -2033,7 +2366,7 @@ class FPSGame:
 
     def _draw_countdown_screen(self, dt: float):
         self._countdown_timer += dt
-        self._draw_menu_bg(self.current_map)
+        self._draw_menu_bg(self.current_map, dt)
 
         accent = MAP_DATA[self.current_map]["accent"]
         cx = WINDOW_W // 2
@@ -2121,7 +2454,7 @@ class FPSGame:
         print("    UP / DOWN            = navigate menus")
         print("    R                    = reload / redeploy")
         print("    D                    = simulate taking damage")
-        print("    ESC                  = quit")
+        print("    ESC                  = return to menu / quit")
         print("    C                    = zero aim")
         print("    F11                  = toggle fullscreen")
         if ENABLE_SERIAL:
@@ -2143,7 +2476,15 @@ class FPSGame:
                 if event.type == pygame.KEYDOWN:
                     # Global keys (always active)
                     if event.key == pygame.K_ESCAPE:
-                        running = False
+                        if self.state == "PLAYING":
+                            # Return to map select, reset game state
+                            self.state = "MAP_SELECT"
+                            self.game_active = False
+                            self.npcs.clear()
+                            self._particles.clear()
+                            self._set_music("menu")
+                        else:
+                            running = False
                     if event.key == pygame.K_F11:
                         self._toggle_fullscreen()
                     if event.key == pygame.K_c:
@@ -2272,15 +2613,19 @@ class FPSGame:
                 err = self.font_med.render("NO VIDEO SIGNAL", True, RED)
                 self.screen.blit(err, err.get_rect(center=(WINDOW_W//2, WINDOW_H//2)))
 
+            # Per-map atmosphere overlay (fog, scope mask, glitch, rain, etc.)
+            self.draw_map_overlay(dt)
+
             # NPC detection overlays
             self.draw_npc_overlays()
 
             # Shoot flash (screen-wide muzzle brightness)
             self.draw_shoot_flash()
 
-            # Vignette + scanlines
+            # Vignette + scanlines + film grain
             self.screen.blit(self._vignette, (0, 0))
             self.screen.blit(self._scanlines, (0, 0))
+            self._draw_grain(dt)
 
             # Muzzle flash (at crosshair, no gun model)
             self.draw_muzzle_flash()
