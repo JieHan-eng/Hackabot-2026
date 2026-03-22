@@ -1531,12 +1531,18 @@ class FPSGame:
                 self.score  = self.kills   # score = kills
                 self._play(self.snd_hit)
                 self.kill_feed.append([time.time(), "HOSTILE ELIMINATED"])
+                if hasattr(self, '_track_shots'):
+                    self._track_shots.append((time.time() - self._track_start, "kill"))
+            else:
+                if hasattr(self, '_track_shots'):
+                    self._track_shots.append((time.time() - self._track_start, "hit"))
         else:
             # ── Miss — standard gunshot only ──
             self._play(self.snd_shoot)
             self.hit_markers.append(
                 HitMarker(int(self.ch_x), int(self.ch_y), confirmed=False))
-            # No score for a miss (encourage aiming)
+            if hasattr(self, '_track_shots'):
+                self._track_shots.append((time.time() - self._track_start, "miss"))
 
         if self.ammo == 0:
             self.start_reload()
@@ -1666,6 +1672,10 @@ class FPSGame:
             if isinstance(event, tuple) and event[0] == "AIM":
                 _, yaw, pitch = event
                 self._dbg_yaw, self._dbg_pitch = yaw, pitch
+                # Track aim data for analytics
+                if self.game_active and hasattr(self, '_track_aim'):
+                    elapsed = time.time() - self._track_start
+                    self._track_aim.append((elapsed, yaw, pitch))
                 if AIM_YAW_INVERT:   yaw   = -yaw
                 if AIM_PITCH_INVERT: pitch = -pitch
                 yaw   -= self._aim_yaw_offset
@@ -1682,9 +1692,12 @@ class FPSGame:
                 self.ch_y = self.ch_y * s + target_y * (1.0 - s)
                 continue
 
-            # JOY tuple — joystick controls robot movement via Pico nRF24,
-            # nothing for the laptop game to do with it
+            # JOY tuple — joystick controls robot movement via Pico nRF24
             if isinstance(event, tuple) and event[0] == "JOY":
+                # Track joy data for analytics
+                if self.game_active and hasattr(self, '_track_joy'):
+                    elapsed = time.time() - self._track_start
+                    self._track_joy.append((elapsed, event[1], event[2]))
                 continue
 
             # String events
@@ -2245,6 +2258,12 @@ class FPSGame:
         self._round_timer   = self.round_time
         self.game_active    = True
         self.shoot_cooldown = 0.15
+        # Analytics tracking
+        self._track_aim     = []    # [(elapsed, yaw, pitch), ...]
+        self._track_joy     = []    # [(elapsed, steer, throttle), ...]
+        self._track_shots   = []    # [(elapsed, "hit"/"miss"/"kill"), ...]
+        self._track_start   = time.time()
+        self._track_sample_t = 0.0
 
     # ── map video filter ─────────────────────────────────────
 
@@ -2887,6 +2906,115 @@ class FPSGame:
         map_label = self.font_small.render(f"MAP:  {MAP_DATA[m]['name']}  //  {MAP_DATA[m]['sub']}", True, (70, 80, 70))
         self.screen.blit(map_label, map_label.get_rect(center=(WINDOW_W // 2, WINDOW_H - 30)))
 
+    # ── post-game analytics ─────────────────────────────────
+
+    def _print_analytics(self):
+        if not hasattr(self, '_track_start'):
+            return
+
+        m = self.current_map
+        map_name = MAP_DATA[m]["name"]
+        duration = self.round_time
+
+        # ── Shot accuracy ──
+        shots = self._track_shots
+        total_shots = len(shots)
+        hits = sum(1 for _, t in shots if t == "hit")
+        kills = sum(1 for _, t in shots if t == "kill")
+        misses = sum(1 for _, t in shots if t == "miss")
+        total_hits = hits + kills
+        hit_pct = (total_hits / total_shots * 100) if total_shots > 0 else 0
+        miss_pct = (misses / total_shots * 100) if total_shots > 0 else 0
+
+        # ── Gun aim stats ──
+        aim = self._track_aim
+        if aim:
+            yaws   = [a[1] for a in aim]
+            pitches = [a[2] for a in aim]
+            avg_yaw   = sum(yaws) / len(yaws)
+            avg_pitch = sum(pitches) / len(pitches)
+            min_yaw, max_yaw     = min(yaws), max(yaws)
+            min_pitch, max_pitch = min(pitches), max(pitches)
+        else:
+            avg_yaw = avg_pitch = 0
+            min_yaw = max_yaw = min_pitch = max_pitch = 0
+
+        # ── Tank movement stats ──
+        joy = self._track_joy
+        if joy:
+            speeds = [abs(j[2]) for j in joy]  # throttle magnitude
+            steers = [abs(j[1]) for j in joy]   # steer magnitude
+            avg_speed = sum(speeds) / len(speeds)
+            avg_steer = sum(steers) / len(steers)
+            moving = sum(1 for s in speeds if s > 5)
+            time_moving = moving / len(speeds) * duration
+            time_idle   = duration - time_moving
+        else:
+            avg_speed = avg_steer = 0
+            time_moving = 0
+            time_idle = duration
+
+        # ── Engagement timeline ──
+        kill_times = [t for t, typ in shots if typ == "kill"]
+        first_kill = min(kill_times) if kill_times else 0
+        last_kill  = max(kill_times) if kill_times else 0
+        if len(kill_times) > 1:
+            avg_between = (last_kill - first_kill) / (len(kill_times) - 1)
+        else:
+            avg_between = 0
+
+        # Build timeline bar (30 chars = 30 seconds)
+        bar_len = 30
+        bar = list("." * bar_len)
+        for t, typ in shots:
+            pos = min(bar_len - 1, int(t / duration * bar_len))
+            if typ == "kill":
+                bar[pos] = "K"
+            elif typ == "hit":
+                bar[pos] = "H"
+            elif typ == "miss" and bar[pos] == ".":
+                bar[pos] = "M"
+        timeline = "".join(bar)
+
+        # ── Print ──
+        w = 58
+        line = "=" * w
+        print(f"\n{'=' * w}")
+        print(f"{'ROBO-HUNTER  ANALYTICS':^{w}}")
+        print(f"{'=' * w}")
+        print(f"  MAP: {map_name:<20}  DURATION: {int(duration)}s")
+        print(f"  KILLS: {kills}")
+        print(f"{'-' * w}")
+
+        print(f"\n  SHOT ACCURACY")
+        print(f"  +-- Shots Fired:    {total_shots}")
+        print(f"  +-- Hits:           {total_hits:>3}  ({hit_pct:.1f}%)")
+        print(f"  +-- Kills:          {kills:>3}")
+        print(f"  +-- Misses:         {misses:>3}  ({miss_pct:.1f}%)")
+
+        print(f"\n  GUN AIM RANGE")
+        print(f"  +-- Avg Yaw:        {avg_yaw:>7.1f} deg")
+        print(f"  +-- Avg Pitch:      {avg_pitch:>7.1f} deg")
+        print(f"  +-- Yaw Range:      {min_yaw:.1f} to {max_yaw:.1f} deg")
+        print(f"  +-- Pitch Range:    {min_pitch:.1f} to {max_pitch:.1f} deg")
+
+        print(f"\n  TANK MOVEMENT")
+        print(f"  +-- Avg Speed:      {avg_speed:>5.1f}%")
+        print(f"  +-- Time Moving:    {time_moving:.1f}s ({time_moving/duration*100:.0f}%)")
+        print(f"  +-- Time Idle:      {time_idle:.1f}s ({time_idle/duration*100:.0f}%)")
+        print(f"  +-- Avg Steer:      {avg_steer:>5.1f}%")
+
+        print(f"\n  ENGAGEMENT TIMELINE ({int(duration)}s)")
+        print(f"  [{timeline}]")
+        print(f"   0s{' ' * 8}10s{' ' * 7}20s{' ' * 6}30s")
+        if kill_times:
+            print(f"  +-- First Kill:     {first_kill:.1f}s")
+            print(f"  +-- Last Kill:      {last_kill:.1f}s")
+            if len(kill_times) > 1:
+                print(f"  +-- Avg Between:    {avg_between:.1f}s")
+
+        print(f"{'=' * w}\n")
+
     # ── name entry screen ────────────────────────────────────
 
     def _draw_name_entry_screen(self, dt: float):
@@ -3080,6 +3208,7 @@ class FPSGame:
                     self._round_timer = 0
                     self.game_active = False
                 if not self.game_active:
+                    self._print_analytics()
                     # Check if top 5
                     if self._is_top5(self.score):
                         self._name_entry = ""

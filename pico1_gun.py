@@ -207,6 +207,7 @@ while True:
 
     # ── SEND TO LAPTOP ───────────────────────────────────────────────────────
     sys.stdout.write("AIM:{:.1f},{:.1f}\n".format(yaw, roll))
+    sys.stdout.write("JOY:{},{}\n".format(steer, throttle))
 
     # ── SEND TO TANK (nRF24) ─────────────────────────────────────────────────
     fire = 1 if shoot_flag else 0
