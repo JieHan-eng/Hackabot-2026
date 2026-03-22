@@ -660,13 +660,27 @@ class FPSGame:
             print(f"[!] snd_empty generation failed: {e}")
             self.snd_empty = None
 
+        # ── snd_menu_select: menu selection sound ──
+        try:
+            _mp = os.path.join(_ASSETS_DIR, "menu_select.mp3")
+            self.snd_menu_select = pygame.mixer.Sound(_mp)
+            print(f"[OK] Menu select sound loaded: menu_select.mp3")
+        except Exception as e:
+            print(f"[!] menu_select.mp3 failed: {e}")
+            self.snd_menu_select = None
+
         # Apply volumes — reload gets its own setting (often needs to be louder)
         for snd in (self.snd_shoot, self.snd_hit_tink,
-                    self.snd_hit, self.snd_damage, self.snd_empty):
+                    self.snd_hit, self.snd_damage, self.snd_empty,
+                    self.snd_menu_select):
             if snd is not None:
                 snd.set_volume(SOUND_VOLUME)
         if self.snd_reload is not None:
             self.snd_reload.set_volume(RELOAD_VOLUME)
+
+    def _play_menu_select(self):
+        if self.snd_menu_select is not None:
+            self.snd_menu_select.play()
 
     def _set_volume(self, vol: float):
         """Set master volume for all sounds + music and show the HUD indicator."""
@@ -2532,17 +2546,22 @@ class FPSGame:
                     # ── Menu / state navigation ──
                     if self.state == "TITLE":
                         if event.key == pygame.K_SPACE:
+                            self._play_menu_select()
                             self.state = "MAP_SELECT"
                     elif self.state == "MAP_SELECT":
                         if event.key == pygame.K_UP:
+                            self._play_menu_select()
                             self.current_map = (self.current_map - 1) % len(MAP_DATA)
                         elif event.key == pygame.K_DOWN:
+                            self._play_menu_select()
                             self.current_map = (self.current_map + 1) % len(MAP_DATA)
                         elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                            self._play_menu_select()
                             self.state = "PRE_CALIB"
                             self._pre_calib_timer = 3.0
                     elif self.state == "END":
                         if event.key == pygame.K_r:
+                            self._play_menu_select()
                             self.state = "TITLE"
                             self._title_timer = 0.0
                             self._set_music("menu")
