@@ -40,8 +40,9 @@ The phone is strapped to the robot tank for a POV camera — it is not wired to 
 | Move gun physically | Aim crosshair (IMU tracking) |
 | Joystick 1 (left stick) | Drive tank (forward/back/steer) |
 | Fire joystick — pull | Shoot |
-| Fire joystick — push | Reload |
-| Fire joystick — press down (SW) | Centre crosshair |
+| Fire joystick — push | Centre crosshair |
+| Fire joystick — press down (SW) | Centre crosshair (backup) |
+| Flick gun up-and-down | Reload |
 
 ### Keyboard
 
@@ -123,8 +124,8 @@ USB serial at 115200 baud. Messages are newline-terminated.
 |---------|---------|
 | `AIM:yaw,roll` | IMU angles — moves crosshair |
 | `SHOOT` | Fire trigger pulled |
-| `RELOAD` | Fire joystick pushed |
-| `ZERO` | Joystick SW pressed — centres crosshair |
+| `RELOAD` | Gun flicked up-and-down (gyro gesture) |
+| `ZERO` | Joystick pushed or SW pressed — centres crosshair |
 
 ---
 
