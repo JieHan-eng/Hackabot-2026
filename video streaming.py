@@ -482,6 +482,7 @@ class FPSGame:
         self.state          = "CONNECTING" if not USE_WEBCAM_FALLBACK else "TITLE"
         self.current_map    = 0
         self._title_timer   = 0.0
+        self._pre_calib_timer = 3.0       # countdown before calibration
         self._calib_timer   = 0.0
         self._calib_delay   = 0.5        # seconds before bar starts filling
         self._calib_duration = 3.0       # calibration bar fill time
@@ -1055,7 +1056,7 @@ class FPSGame:
                         line = line.strip()
                         cmd  = line.upper()
 
-                        if cmd in ("SHOOT", "HIT", "RELOAD"):
+                        if cmd in ("SHOOT", "HIT", "RELOAD", "ZERO"):
                             self._serial_events.put(cmd)
 
                         elif cmd.startswith("AIM:"):
@@ -1487,6 +1488,12 @@ class FPSGame:
                 self.take_damage()
             elif cmd == "RELOAD":
                 self.start_reload()
+            elif cmd == "ZERO":
+                self._aim_yaw_offset   = self._dbg_yaw
+                self._aim_pitch_offset = self._dbg_pitch
+                self.ch_x = float(WINDOW_W // 2)
+                self.ch_y = float(WINDOW_H // 2)
+                self._rezero_flash = 1.5
 
     # ── video frame ──────────────────────────────────────────
 
@@ -2315,6 +2322,30 @@ class FPSGame:
         sl.fill((accent[0], accent[1], accent[2], 14))
         self.screen.blit(sl, (right_x, sweep_y))
 
+    # ── pre-calibration countdown ──────────────────────────────
+
+    def _draw_pre_calib_screen(self, dt: float):
+        self._pre_calib_timer -= dt
+        self._draw_menu_bg(self.current_map, dt)
+
+        accent = MAP_DATA[self.current_map]["accent"]
+        cx = WINDOW_W // 2
+        cy = WINDOW_H // 2
+
+        title = self.font_big.render("HOLD GUN STILL", True, accent)
+        self.screen.blit(title, title.get_rect(center=(cx, cy - 60)))
+
+        instr = self.font_med.render("Keep the gun level and steady...", True, (160, 165, 155))
+        self.screen.blit(instr, instr.get_rect(center=(cx, cy)))
+
+        count = max(1, int(self._pre_calib_timer) + 1)
+        num_surf = self.font_big.render(str(count), True, accent)
+        self.screen.blit(num_surf, num_surf.get_rect(center=(cx, cy + 70)))
+
+        if self._pre_calib_timer <= 0:
+            self.state = "CALIBRATING"
+            self._calib_timer = 0.0
+
     # ── calibrating screen ───────────────────────────────────
 
     def _draw_calibrating_screen(self, dt: float):
@@ -2508,8 +2539,8 @@ class FPSGame:
                         elif event.key == pygame.K_DOWN:
                             self.current_map = (self.current_map + 1) % len(MAP_DATA)
                         elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
-                            self.state = "CALIBRATING"
-                            self._calib_timer = 0.0
+                            self.state = "PRE_CALIB"
+                            self._pre_calib_timer = 3.0
                     elif self.state == "END":
                         if event.key == pygame.K_r:
                             self.state = "TITLE"
@@ -2577,6 +2608,12 @@ class FPSGame:
 
             if self.state == "MAP_SELECT":
                 self._draw_map_select_screen(dt)
+                pygame.display.flip()
+                self.clock.tick(60)
+                continue
+
+            if self.state == "PRE_CALIB":
+                self._draw_pre_calib_screen(dt)
                 pygame.display.flip()
                 self.clock.tick(60)
                 continue

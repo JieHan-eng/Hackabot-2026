@@ -41,6 +41,7 @@ I2C_SCL  = 5
 JOY1_X   = 26   # steer  (robot left/right)
 JOY1_Y   = 27   # throttle (robot fwd/back)
 JOY2_Y   = 28   # fire trigger
+JOY2_SW  = 22   # fire joystick center button (press to zero aim)
 RELOAD_PIN = 15
 IR_LED_PIN = 14  # moved from GP16 (nRF24 MISO uses GP16)
 
@@ -110,7 +111,8 @@ imu.init()
 
 joy1_x = ADC(Pin(JOY1_X))
 joy1_y = ADC(Pin(JOY1_Y))
-joy2_y = ADC(Pin(JOY2_Y))
+joy2_y  = ADC(Pin(JOY2_Y))
+joy2_sw = Pin(JOY2_SW, Pin.IN, Pin.PULL_UP)
 reload_btn = Pin(RELOAD_PIN, Pin.IN, Pin.PULL_UP)
 ir_led     = Pin(IR_LED_PIN, Pin.OUT); ir_led.value(0)
 
@@ -134,9 +136,9 @@ print("\n=== READY — streaming to laptop ===")
 # ═══════════════════════════════════════════════════════════════════════════════
 #  STATE
 # ═══════════════════════════════════════════════════════════════════════════════
-last_reload_state = 1
-last_rel_ms       = 0
 last_fire_state   = False
+last_reload_state = False
+last_sw_state     = 1       # joystick button (active low)
 INTERVAL_MS       = 1000 // SEND_HZ
 tx_ok   = 0
 tx_fail = 0
@@ -155,27 +157,28 @@ while True:
     steer    = read_joystick(joy1_y, joy_center['j1y'])
     throttle = read_joystick(joy1_x, joy_center['j1x'])
     fire_raw = read_joystick(joy2_y, joy_center['j2y'])
-    fire_now = abs(fire_raw) > FIRE_THRESHOLD
+    fire_pull = fire_raw > FIRE_THRESHOLD     # pull toward you = fire
+    fire_push = fire_raw < -FIRE_THRESHOLD   # push away = reload
 
-    # ── SHOOT (rising edge of fire trigger) ──────────────────────────────────
+    # ── SHOOT (rising edge of pull trigger) ──────────────────────────────────
     shoot_flag = False
-    if fire_now and not last_fire_state:
+    if fire_pull and not last_fire_state:
         sys.stdout.write("SHOOT\n")
         ir_led.value(1); sleep_ms(25); ir_led.value(0)
         shoot_flag = True
-    last_fire_state = fire_now
+    last_fire_state = fire_pull
 
-    # ── RELOAD BUTTON ────────────────────────────────────────────────────────
-    rel = reload_btn.value()
-    if rel == 0 and last_reload_state == 1:
-        if ticks_diff(ticks_ms(), last_rel_ms) > DEBOUNCE_MS:
-            sys.stdout.write("RELOAD\n")
-            # Hold reload + fire → re-zero yaw
-            if fire_now:
-                imu.reset_yaw()
-                sys.stdout.write("AIM:0.0,0.0\n")
-            last_rel_ms = ticks_ms()
-    last_reload_state = rel
+    # ── RELOAD (rising edge of push trigger) ─────────────────────────────────
+    if fire_push and not last_reload_state:
+        sys.stdout.write("RELOAD\n")
+    last_reload_state = fire_push
+
+    # ── ZERO AIM (joystick center button press) ────────────────────────────
+    sw = joy2_sw.value()
+    if sw == 0 and last_sw_state == 1:
+        imu.reset_yaw()
+        sys.stdout.write("ZERO\n")
+    last_sw_state = sw
 
     # ── SEND TO LAPTOP ───────────────────────────────────────────────────────
     sys.stdout.write("AIM:{:.1f},{:.1f}\n".format(yaw, roll))
