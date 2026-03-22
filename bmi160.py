@@ -141,7 +141,7 @@ class BMI160:
         alpha = 0.96
         self.roll = alpha * (self.roll + gx * dt) + (1.0 - alpha) * accel_roll
 
-        return self.yaw, self.roll, gz
+        return self.yaw, self.roll, gz, gy
 
     def reset_yaw(self):
         """Reset yaw to 0 (re-center)."""

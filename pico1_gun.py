@@ -62,6 +62,12 @@ FIRE_THRESHOLD = 25   # joystick deflection % to count as firing
 DEBOUNCE_MS    = 60
 JOY_DEADZONE   = 4000 # ADC units
 
+# ── RELOAD GESTURE (flick gun up-and-down) ──────────────────────────────────
+FLICK_THRESHOLD    = 120   # dps — GX must exceed this to start a flick
+FLICK_REVERSE_THR  = 80    # dps — GX must go below -this to confirm reversal
+FLICK_WINDOW_MS    = 400   # ms  — reversal must happen within this window
+RELOAD_COOLDOWN_MS = 1500  # ms  — ignore gestures for this long after reload
+
 # ── PACKET FORMAT (16 bytes, must match tank) ────────────────────────────────
 PACK_FMT = '<ffbbBx'   # yaw(f) + roll(f) + steer(b) + throttle(b) + fire(B) + pad
 
@@ -137,8 +143,11 @@ print("\n=== READY — streaming to laptop ===")
 #  STATE
 # ═══════════════════════════════════════════════════════════════════════════════
 last_fire_state   = False
-last_reload_state = False
+last_push_state   = False
 last_sw_state     = 1       # joystick button (active low)
+flick_state       = 0       # 0=idle, 1=upstroke detected
+flick_start_ms    = 0
+last_reload_ms    = 0
 INTERVAL_MS       = 1000 // SEND_HZ
 tx_ok   = 0
 tx_fail = 0
@@ -151,14 +160,14 @@ while True:
     t0 = ticks_ms()
 
     # ── IMU ──────────────────────────────────────────────────────────────────
-    yaw, roll, gz = imu.update()
+    yaw, roll, gz, gx = imu.update()
 
     # ── JOYSTICKS ────────────────────────────────────────────────────────────
     steer    = read_joystick(joy1_y, joy_center['j1y'])
     throttle = read_joystick(joy1_x, joy_center['j1x'])
     fire_raw = read_joystick(joy2_y, joy_center['j2y'])
     fire_pull = fire_raw > FIRE_THRESHOLD     # pull toward you = fire
-    fire_push = fire_raw < -FIRE_THRESHOLD   # push away = reload
+    fire_push = fire_raw < -FIRE_THRESHOLD    # push away = centre crosshair
 
     # ── SHOOT (rising edge of pull trigger) ──────────────────────────────────
     shoot_flag = False
@@ -168,17 +177,33 @@ while True:
         shoot_flag = True
     last_fire_state = fire_pull
 
-    # ── RELOAD (rising edge of push trigger) ─────────────────────────────────
-    if fire_push and not last_reload_state:
-        sys.stdout.write("RELOAD\n")
-    last_reload_state = fire_push
+    # ── ZERO AIM (push joystick away) ────────────────────────────────────────
+    if fire_push and not last_push_state:
+        imu.reset_yaw()
+        sys.stdout.write("ZERO\n")
+    last_push_state = fire_push
 
-    # ── ZERO AIM (joystick center button press) ────────────────────────────
+    # ── ZERO AIM (joystick center button press — backup) ─────────────────────
     sw = joy2_sw.value()
     if sw == 0 and last_sw_state == 1:
         imu.reset_yaw()
         sys.stdout.write("ZERO\n")
     last_sw_state = sw
+
+    # ── RELOAD (flick gun up-and-down gesture) ───────────────────────────────
+    now_ms = ticks_ms()
+    cooldown_ok = ticks_diff(now_ms, last_reload_ms) > RELOAD_COOLDOWN_MS
+    if flick_state == 0:
+        if gx > FLICK_THRESHOLD and cooldown_ok:
+            flick_state = 1
+            flick_start_ms = now_ms
+    elif flick_state == 1:
+        if gx < -FLICK_REVERSE_THR:
+            sys.stdout.write("RELOAD\n")
+            flick_state = 0
+            last_reload_ms = now_ms
+        elif ticks_diff(now_ms, flick_start_ms) > FLICK_WINDOW_MS:
+            flick_state = 0
 
     # ── SEND TO LAPTOP ───────────────────────────────────────────────────────
     sys.stdout.write("AIM:{:.1f},{:.1f}\n".format(yaw, roll))
