@@ -528,6 +528,17 @@ class FPSGame:
         self._grain_idx    = 0
         self._grain_tick   = 0.0
         self._nv_mask      = self._make_nv_mask()
+        self._frost_border = self._make_frost_border()
+        self._rubble_sil   = self._make_rubble_silhouette()
+        self._vine_border  = self._make_vine_border()
+        self._holo_grid    = self._make_holo_grid()
+        self._radial_mask  = self._make_radial_mask()
+        self._bottom_grad  = self._make_bottom_gradient()
+        self._rain_drops   = [[random.randint(50, WINDOW_W-50),
+                               random.randint(50, WINDOW_H-50),
+                               random.randint(8, 14)] for _ in range(6)]
+        self._lightning_cd = 0.0
+        self._nv_sway_t    = 0.0
 
         # Detection worker (runs in background thread)
         self._det_worker = None
@@ -766,6 +777,127 @@ class FPSGame:
                                 (cx - er, cy - ep, er * 2, ep * 2), 0)
         return surf
 
+    @staticmethod
+    def _make_frost_border() -> pygame.Surface:
+        """Irregular icy frost shapes along screen edges."""
+        surf = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+        rng = random.Random(42)
+        for edge in range(4):  # top, bottom, left, right
+            for _ in range(18):
+                if edge == 0:    # top
+                    cx = rng.randint(0, WINDOW_W)
+                    cy = rng.randint(0, 60)
+                elif edge == 1:  # bottom
+                    cx = rng.randint(0, WINDOW_W)
+                    cy = rng.randint(WINDOW_H - 80, WINDOW_H)
+                elif edge == 2:  # left
+                    cx = rng.randint(0, 70)
+                    cy = rng.randint(0, WINDOW_H)
+                else:            # right
+                    cx = rng.randint(WINDOW_W - 70, WINDOW_W)
+                    cy = rng.randint(0, WINDOW_H)
+                pts = []
+                n = rng.randint(5, 9)
+                for i in range(n):
+                    angle = i * 2 * 3.14159 / n + rng.uniform(-0.4, 0.4)
+                    r = rng.randint(12, 45)
+                    pts.append((int(cx + r * math.cos(angle)),
+                                int(cy + r * math.sin(angle))))
+                a = rng.randint(40, 90)
+                pygame.draw.polygon(surf, (200, 220, 255, a), pts)
+        return surf
+
+    @staticmethod
+    def _make_rubble_silhouette() -> pygame.Surface:
+        """Jagged rubble silhouette along the bottom edge."""
+        surf = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+        rng = random.Random(77)
+        pts = [(0, WINDOW_H)]
+        x = 0
+        while x < WINDOW_W:
+            h = rng.randint(10, 40)
+            pts.append((x, WINDOW_H - h))
+            x += rng.randint(15, 50)
+        pts.append((WINDOW_W, WINDOW_H))
+        pygame.draw.polygon(surf, (0, 0, 0, 180), pts)
+        return surf
+
+    @staticmethod
+    def _make_vine_border() -> pygame.Surface:
+        """Organic vine/leaf silhouettes framing the top and sides."""
+        surf = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+        rng = random.Random(33)
+        dark_green = (5, 25, 5, 160)
+        # Top edge vines
+        for _ in range(25):
+            cx = rng.randint(0, WINDOW_W)
+            cy = rng.randint(-10, 50)
+            pts = []
+            n = rng.randint(4, 7)
+            for i in range(n):
+                angle = i * 2 * 3.14159 / n + rng.uniform(-0.5, 0.5)
+                r = rng.randint(15, 55)
+                pts.append((int(cx + r * math.cos(angle)),
+                            int(cy + r * math.sin(angle))))
+            pygame.draw.polygon(surf, dark_green, pts)
+        # Side edges
+        for side_x in [0, WINDOW_W]:
+            for _ in range(12):
+                cx = side_x + rng.randint(-30, 30)
+                cy = rng.randint(0, WINDOW_H)
+                pts = []
+                n = rng.randint(4, 6)
+                for i in range(n):
+                    angle = i * 2 * 3.14159 / n + rng.uniform(-0.5, 0.5)
+                    r = rng.randint(15, 45)
+                    pts.append((int(cx + r * math.cos(angle)),
+                                int(cy + r * math.sin(angle))))
+                pygame.draw.polygon(surf, dark_green, pts)
+        # Bottom corner leaves
+        for _ in range(10):
+            side = rng.choice([0, 1])
+            cx = rng.randint(0, 120) if side == 0 else rng.randint(WINDOW_W - 120, WINDOW_W)
+            cy = rng.randint(WINDOW_H - 80, WINDOW_H)
+            pts = []
+            n = rng.randint(4, 6)
+            for i in range(n):
+                angle = i * 2 * 3.14159 / n + rng.uniform(-0.4, 0.4)
+                r = rng.randint(20, 50)
+                pts.append((int(cx + r * math.cos(angle)),
+                            int(cy + r * math.sin(angle))))
+            pygame.draw.polygon(surf, dark_green, pts)
+        return surf
+
+    @staticmethod
+    def _make_holo_grid() -> pygame.Surface:
+        """Faint cyan grid for cyberpunk holographic overlay."""
+        surf = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+        col = (0, 210, 255, 10)
+        for x in range(0, WINDOW_W, 60):
+            pygame.draw.line(surf, col, (x, 0), (x, WINDOW_H), 1)
+        for y in range(0, WINDOW_H, 60):
+            pygame.draw.line(surf, col, (0, y), (WINDOW_W, y), 1)
+        return surf
+
+    @staticmethod
+    def _make_radial_mask() -> np.ndarray:
+        """Radial gradient mask: 0 at center, 1 at edges. For edge blur effects."""
+        ys = np.linspace(-1, 1, WINDOW_H).reshape(-1, 1)
+        xs = np.linspace(-1, 1, WINDOW_W).reshape(1, -1)
+        dist = np.sqrt(xs**2 + ys**2)
+        mask = np.clip((dist - 0.5) / 0.5, 0, 1).astype(np.float32)
+        return mask
+
+    @staticmethod
+    def _make_bottom_gradient() -> np.ndarray:
+        """Brightness multiplier array: 1.0 at top, fades to 0.65 at bottom 30%."""
+        grad = np.ones((WINDOW_H, 1), dtype=np.float32)
+        fade_start = int(WINDOW_H * 0.7)
+        for y in range(fade_start, WINDOW_H):
+            frac = (y - fade_start) / (WINDOW_H - fade_start)
+            grad[y, 0] = 1.0 - frac * 0.35
+        return grad
+
     # ── grain / particles / overlays ─────────────────────────
 
     def _draw_grain(self, dt: float):
@@ -937,79 +1069,124 @@ class FPSGame:
         now = time.time()
 
         if f == "arctic":
-            # White-fog vignette at edges (blizzard)
-            fog = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
-            for i in range(30):
-                a = int(90 * (1 - i / 30))
-                m = i * min(WINDOW_W, WINDOW_H) // 60
-                pygame.draw.rect(fog, (220, 230, 255, a),
-                                 (m, m, WINDOW_W - 2*m, WINDOW_H - 2*m), 4)
-            self.screen.blit(fog, (0, 0))
-            # Pillar-box side bars (narrow horizontal FOV feel)
-            bar_w = int(WINDOW_W * 0.07)
-            bar = pygame.Surface((bar_w, WINDOW_H), pygame.SRCALPHA)
-            bar.fill((180, 200, 240, 90))
-            self.screen.blit(bar, (0, 0))
-            self.screen.blit(bar, (WINDOW_W - bar_w, 0))
-            # Drifting snow flecks over the camera feed
+            # Pre-rendered irregular frost border
+            self.screen.blit(self._frost_border, (0, 0))
+            # Animated fog band (blowing snow gust)
+            fog_y = int(WINDOW_H * 0.4 + math.sin(now * 0.3) * WINDOW_H * 0.15)
+            fog_band = pygame.Surface((WINDOW_W, 80), pygame.SRCALPHA)
+            fog_band.fill((220, 230, 255, 25))
+            self.screen.blit(fog_band, (0, fog_y))
+            # Breath fog pulse (every ~4 seconds)
+            breath_phase = (now % 4.0) / 4.0
+            if breath_phase < 0.15:
+                breath_a = int(35 * math.sin(breath_phase / 0.15 * 3.14159))
+                breath = pygame.Surface((200, 80), pygame.SRCALPHA)
+                pygame.draw.ellipse(breath, (220, 230, 255, breath_a), (0, 0, 200, 80))
+                self.screen.blit(breath, (WINDOW_W // 2 - 100, WINDOW_H - 100))
+            # Snow particles
             self._update_and_draw_particles(dt, self.current_map)
 
         elif f == "warzone":
-            # Orange smoke haze at edges
-            haze = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
-            for i in range(20):
-                a = int(55 * (1 - i / 20))
-                m = i * min(WINDOW_W, WINDOW_H) // 40
-                pygame.draw.rect(haze, (40, 20, 5, a),
-                                 (m, m, WINDOW_W - 2*m, WINDOW_H - 2*m), 6)
-            self.screen.blit(haze, (0, 0))
-            # Subtle animated dust streak
+            # Rubble silhouette at bottom
+            self.screen.blit(self._rubble_sil, (0, 0))
+            # Animated smoke wisps drifting at edges
+            for i in range(4):
+                sx = int((i * WINDOW_W // 3 + now * 12) % (WINDOW_W + 200) - 100)
+                sy = int(WINDOW_H * (0.1 + i * 0.2) + math.sin(now * 0.5 + i) * 30)
+                smoke = pygame.Surface((180, 90), pygame.SRCALPHA)
+                pygame.draw.ellipse(smoke, (40, 20, 5, 18), (0, 0, 180, 90))
+                self.screen.blit(smoke, (sx, sy))
+            # Flickering firelight
+            if random.random() < 0.3:
+                fire_tint = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+                fire_tint.fill((255, 120, 20, random.randint(3, 8)))
+                self.screen.blit(fire_tint, (0, 0))
+            # Ember particles
             self._update_and_draw_particles(dt, self.current_map)
 
         elif f == "jungle":
-            # Green foliage vignette — lush corner darkening
-            fog = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
-            for i in range(25):
-                a = int(70 * (1 - i / 25))
-                m = i * min(WINDOW_W, WINDOW_H) // 50
-                pygame.draw.rect(fog, (5, 30, 8, a),
-                                 (m, m, WINDOW_W - 2*m, WINDOW_H - 2*m), 5)
-            self.screen.blit(fog, (0, 0))
-            # Rain streaks
+            # Vine/leaf silhouettes framing the view
+            self.screen.blit(self._vine_border, (0, 0))
+            # Rain droplets on lens (slowly sliding down)
+            for drop in self._rain_drops:
+                drop[1] += dt * 15  # slide down slowly
+                if drop[1] > WINDOW_H + 20:
+                    drop[0] = random.randint(50, WINDOW_W - 50)
+                    drop[1] = random.randint(-20, 50)
+                    drop[2] = random.randint(8, 14)
+                droplet = pygame.Surface((drop[2]*2, drop[2]*2), pygame.SRCALPHA)
+                pygame.draw.circle(droplet, (200, 220, 200, 18), (drop[2], drop[2]), drop[2])
+                pygame.draw.circle(droplet, (230, 245, 230, 30), (drop[2], drop[2]), drop[2]//2)
+                self.screen.blit(droplet, (int(drop[0] - drop[2]), int(drop[1] - drop[2])))
+            # Lightning flash (every 8-15 seconds)
+            self._lightning_cd -= dt
+            if self._lightning_cd <= 0:
+                flash = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+                flash.fill((255, 255, 255, 25))
+                self.screen.blit(flash, (0, 0))
+                if self._lightning_cd <= -0.05:
+                    self._lightning_cd = random.uniform(8, 15)
+            # Rain streak particles
             self._update_and_draw_particles(dt, self.current_map)
 
         elif f == "nightops":
-            # Night-vision goggle scope mask (black outside oval)
-            self.screen.blit(self._nv_mask, (0, 0))
-            # Green CRT scanlines over the NV view
+            # Night-vision goggle scope mask with subtle sway
+            self._nv_sway_t += dt
+            sway_x = int(math.sin(self._nv_sway_t * 0.8) * 3)
+            sway_y = int(math.cos(self._nv_sway_t * 1.1) * 2)
+            self.screen.blit(self._nv_mask, (sway_x, sway_y))
+            # Green CRT scanlines
             nv_scan = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
             for y in range(0, WINDOW_H, 3):
                 pygame.draw.line(nv_scan, (0, 60, 0, 18), (0, y), (WINDOW_W, y))
             self.screen.blit(nv_scan, (0, 0))
-            # Phosphor glow ring around scope edge
-            ring = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+            # Pulsing phosphor glow ring
             rx, ry_ = int(WINDOW_W * 0.38), int(WINDOW_H * 0.48)
             cx, cy_ = WINDOW_W // 2, WINDOW_H // 2
+            ring = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+            pulse = 0.7 + 0.3 * math.sin(now * 2.5)
             for t in range(3):
-                pygame.draw.ellipse(ring, (0, 180, 60, 30 - t*8),
-                                    (cx - rx - t*3, cy_ - ry_ - t*3,
+                a = int((30 - t * 8) * pulse)
+                pygame.draw.ellipse(ring, (0, 180, 60, max(0, a)),
+                                    (cx - rx - t*3 + sway_x, cy_ - ry_ - t*3 + sway_y,
                                      (rx + t*3)*2, (ry_ + t*3)*2), 2)
             self.screen.blit(ring, (0, 0))
+            # NV goggle info text
+            info = pygame.Surface((160, 40), pygame.SRCALPHA)
+            gain_txt = self.font_small.render("GAIN: AUTO", True, (0, 160, 60))
+            bat_pct = 87 - int(now % 100) // 10
+            bat_txt = self.font_small.render(f"BAT: {bat_pct}%", True, (0, 160, 60))
+            info.blit(gain_txt, (0, 0))
+            info.blit(bat_txt, (0, 16))
+            self.screen.blit(info, (cx - rx + 30 + sway_x, cy_ - ry_ + 20 + sway_y))
 
         else:  # cyberpunk
-            # Glitch horizontal bands (random, brief)
-            if random.random() < 0.04:
-                glitch = pygame.Surface((WINDOW_W, random.randint(2, 8)), pygame.SRCALPHA)
-                glitch.fill((0, 210, 255, 40))
-                self.screen.blit(glitch, (0, random.randint(0, WINDOW_H)))
-            # Cyan edge fringe
-            fringe = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
-            for i in range(15):
-                a = int(50 * (1 - i / 15))
-                m = i * min(WINDOW_W, WINDOW_H) // 30
-                pygame.draw.rect(fringe, (0, 40, 60, a),
-                                 (m, m, WINDOW_W - 2*m, WINDOW_H - 2*m), 4)
-            self.screen.blit(fringe, (0, 0))
+            # Holographic grid overlay
+            self.screen.blit(self._holo_grid, (0, 0))
+            # Glitch bands (more aggressive, multiple)
+            if random.random() < 0.08:
+                for _ in range(random.randint(2, 4)):
+                    gh = random.randint(2, 8)
+                    gy = random.randint(0, WINDOW_H - gh)
+                    col = random.choice([(0, 210, 255, 35), (255, 0, 200, 30), (255, 255, 255, 20)])
+                    glitch = pygame.Surface((WINDOW_W, gh), pygame.SRCALPHA)
+                    glitch.fill(col)
+                    self.screen.blit(glitch, (0, gy))
+            # Full-screen tear (rare)
+            if random.random() < 0.01:
+                shift = random.randint(-15, 15)
+                strip_h = random.randint(40, 120)
+                strip_y = random.randint(0, WINDOW_H - strip_h)
+                area = self.screen.subsurface((0, strip_y, WINDOW_W, strip_h)).copy()
+                self.screen.blit(area, (shift, strip_y))
+            # Neon reflections at bottom (wet street)
+            refl = pygame.Surface((WINDOW_W, int(WINDOW_H * 0.12)), pygame.SRCALPHA)
+            for i in range(6):
+                rx = int((i * WINDOW_W // 5 + now * 20) % WINDOW_W)
+                rw = random.randint(60, 140)
+                col = (255, 0, 200, 12) if i % 2 == 0 else (0, 210, 255, 12)
+                pygame.draw.ellipse(refl, col, (rx - rw//2, 0, rw, refl.get_height()))
+            self.screen.blit(refl, (0, WINDOW_H - refl.get_height()))
 
     # ── serial ───────────────────────────────────────────────
 
@@ -1850,6 +2027,12 @@ class FPSGame:
         self._scanlines    = self._make_scanlines()
         self._grain_frames = self._make_grain_frames()
         self._nv_mask      = self._make_nv_mask()
+        self._frost_border = self._make_frost_border()
+        self._rubble_sil   = self._make_rubble_silhouette()
+        self._vine_border  = self._make_vine_border()
+        self._holo_grid    = self._make_holo_grid()
+        self._radial_mask  = self._make_radial_mask()
+        self._bottom_grad  = self._make_bottom_gradient()
         self._particles.clear()
         # Re-centre crosshair
         self.ch_x = float(WINDOW_W // 2)
@@ -2018,47 +2201,97 @@ class FPSGame:
     def apply_map_filter(self, frame: np.ndarray) -> np.ndarray:
         """Apply a dramatic map-specific visual filter to the live BGR frame."""
         f = MAP_DATA[self.current_map]["filter"]
+        h, w = frame.shape[:2]
 
         if f == "arctic":
             # Heavy desaturation + cold blue shift
             grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             grey3 = cv2.cvtColor(grey, cv2.COLOR_GRAY2BGR)
             out = cv2.addWeighted(frame, 0.15, grey3, 0.85, 0)
-            # Blue channel boost, red drop
             out = out.astype(np.int16)
-            out[:, :, 0] = np.clip(out[:, :, 0] + 55, 0, 255)  # blue
-            out[:, :, 2] = np.clip(out[:, :, 2] - 25, 0, 255)  # red
-            return out.astype(np.uint8)
+            out[:, :, 0] = np.clip(out[:, :, 0] + 55, 0, 255)   # blue boost
+            out[:, :, 2] = np.clip(out[:, :, 2] - 25, 0, 255)   # red drop
+            # Frost edges — faint white on object edges
+            edges = cv2.Laplacian(grey, cv2.CV_8U, ksize=3)
+            edges = cv2.threshold(edges, 40, 255, cv2.THRESH_BINARY)[1]
+            edge3 = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR).astype(np.int16)
+            out = np.clip(out + edge3 // 5, 0, 255)
+            # Blow out highlights (sun on snow)
+            bright = grey > 200
+            for c in range(3):
+                out[:, :, c] = np.where(bright, np.clip(out[:, :, c] + 40, 0, 255), out[:, :, c])
+            # Bottom whiteout gradient
+            grad = cv2.resize(self._bottom_grad, (w, h), interpolation=cv2.INTER_LINEAR)
+            if grad.ndim == 2:
+                grad = grad[:, :, np.newaxis]
+            for c in range(3):
+                out[:, :, c] = (out[:, :, c].astype(np.float32) * grad[:, :, 0]).astype(np.int16)
+            return np.clip(out, 0, 255).astype(np.uint8)
 
         elif f == "warzone":
             # Harsh sepia + warm orange grade + contrast crunch
             grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             eq   = cv2.equalizeHist(grey)
+            # Lift shadows (dusty atmosphere)
+            eq_i = eq.astype(np.int32)
+            eq_i = np.where(eq_i < 40, eq_i + 15, eq_i)
             warm = cv2.merge([
-                np.clip(eq.astype(np.int32) + 10, 0, 255).astype(np.uint8),   # blue-ish
-                np.clip(eq.astype(np.int32) - 5,  0, 255).astype(np.uint8),   # green
-                np.clip(eq.astype(np.int32) + 35, 0, 255).astype(np.uint8),   # red
+                np.clip(eq_i + 10, 0, 255).astype(np.uint8),
+                np.clip(eq_i - 5,  0, 255).astype(np.uint8),
+                np.clip(eq_i + 35, 0, 255).astype(np.uint8),
             ])
-            return cv2.addWeighted(warm, 0.85, frame, 0.15, 0)
+            out = cv2.addWeighted(warm, 0.85, frame, 0.15, 0)
+            # Warm glow in upper portion (firelight from above)
+            top_fade = np.ones((h, w), dtype=np.float32)
+            fade_end = int(h * 0.35)
+            for y in range(fade_end):
+                top_fade[y, :] = 1.0 + 0.12 * (1.0 - y / fade_end)
+            out = out.astype(np.float32)
+            out[:, :, 2] = np.clip(out[:, :, 2] * top_fade, 0, 255)  # red/orange glow
+            out[:, :, 1] = np.clip(out[:, :, 1] * (top_fade * 0.5 + 0.5), 0, 255)
+            # Edge blur for peripheral dust haze (center sharp, edges blurred)
+            blurred = cv2.GaussianBlur(out.astype(np.uint8), (7, 7), 0).astype(np.float32)
+            mask = cv2.resize(self._radial_mask, (w, h), interpolation=cv2.INTER_LINEAR)
+            mask3 = mask[:, :, np.newaxis]
+            out = out * (1 - mask3) + blurred * mask3
+            return np.clip(out, 0, 255).astype(np.uint8)
 
         elif f == "jungle":
-            # Aggressive green channel push + slight haze
             out = frame.astype(np.int16).copy()
-            out[:, :, 1] = np.clip(out[:, :, 1] + 55, 0, 255)  # green
-            out[:, :, 0] = np.clip(out[:, :, 0] - 20, 0, 255)  # blue
-            out[:, :, 2] = np.clip(out[:, :, 2] - 30, 0, 255)  # red
-            # Slight blur for atmospheric haze
-            blurred = cv2.GaussianBlur(out.astype(np.uint8), (3, 3), 0)
-            return cv2.addWeighted(out.astype(np.uint8), 0.7, blurred, 0.3, 0)
+            out[:, :, 1] = np.clip(out[:, :, 1] + 45, 0, 255)   # green push
+            out[:, :, 0] = np.clip(out[:, :, 0] - 20, 0, 255)   # blue drop
+            out[:, :, 2] = np.clip(out[:, :, 2] - 30, 0, 255)   # red drop
+            # Humidity haze in bright green areas
+            g_ch = out[:, :, 1]
+            haze_mask = (g_ch > 140).astype(np.float32) * 0.1
+            for c, val in enumerate([170, 210, 170]):
+                out[:, :, c] = np.clip(
+                    out[:, :, c] * (1 - haze_mask) + val * haze_mask, 0, 255).astype(np.int16)
+            out = out.astype(np.uint8)
+            # Peripheral depth-of-field blur (edges blurred, center sharp)
+            blurred = cv2.GaussianBlur(out, (7, 7), 0)
+            mask = cv2.resize(self._radial_mask, (w, h), interpolation=cv2.INTER_LINEAR)
+            mask3 = mask[:, :, np.newaxis]
+            out = (out.astype(np.float32) * (1 - mask3) + blurred.astype(np.float32) * mask3)
+            return np.clip(out, 0, 255).astype(np.uint8)
 
         elif f == "nightops":
-            # True night-vision green — CLAHE contrast + green channel only
+            # Night-vision: CLAHE + green channel + bloom + NV noise
             grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
             eq = clahe.apply(grey)
-            # Add mild phosphor glow (slight blur overlay)
+            # Phosphor glow
             glow = cv2.GaussianBlur(eq, (5, 5), 0)
             eq = np.clip(eq.astype(np.int16) + glow.astype(np.int16) // 4, 0, 255).astype(np.uint8)
+            # Auto-gain bloom on bright areas
+            bright = (eq > 210).astype(np.uint8) * 255
+            bloom = cv2.GaussianBlur(bright, (15, 15), 0)
+            eq = np.clip(eq.astype(np.int16) + bloom.astype(np.int16) // 3, 0, 255).astype(np.uint8)
+            # Coarse NV noise (blocky, green-tinted)
+            noise_small = np.random.randint(-14, 14, (h // 4, w // 4), dtype=np.int16)
+            noise = cv2.resize(noise_small.astype(np.float32), (w, h),
+                               interpolation=cv2.INTER_NEAREST).astype(np.int16)
+            eq = np.clip(eq.astype(np.int16) + noise, 0, 255).astype(np.uint8)
             nv = cv2.merge([
                 np.zeros_like(eq),
                 np.clip(eq.astype(np.int32) - 20, 0, 255).astype(np.uint8),
@@ -2067,19 +2300,37 @@ class FPSGame:
             return nv
 
         else:  # cyberpunk
-            # Max saturation + chromatic aberration shift + neon tint
+            # Max saturation + darkness
             hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV).astype(np.float32)
             hsv[:, :, 1] = np.clip(hsv[:, :, 1] * 2.2, 0, 255)
-            hsv[:, :, 2] = np.clip(hsv[:, :, 2] * 0.80, 0, 255)
+            hsv[:, :, 2] = np.clip(hsv[:, :, 2] * 0.75, 0, 255)
             out = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
-            # Chromatic aberration: shift red channel right by 3px
-            r_shifted = np.roll(out[:, :, 2], 3, axis=1)
-            out[:, :, 2] = r_shifted
-            # Neon overlay
-            out = out.astype(np.int16)
-            out[:, :, 0] = np.clip(out[:, :, 0] + 30, 0, 255)  # blue
-            out[:, :, 2] = np.clip(out[:, :, 2] - 10, 0, 255)  # reduce red
-            return out.astype(np.uint8)
+            # Full RGB chromatic aberration
+            b, g, r = cv2.split(out)
+            r = np.roll(r, 3, axis=1)    # red shifts right
+            b = np.roll(b, -2, axis=1)   # blue shifts left
+            out = cv2.merge([b, g, r])
+            # Neon edge glow (cyan/magenta alternating)
+            grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            edges = cv2.Canny(grey, 80, 180)
+            edges = cv2.dilate(edges, np.ones((2, 2), np.uint8))
+            edge_color = np.zeros_like(out)
+            # Alternate cyan/magenta by row bands
+            for y in range(h):
+                if (y // 40) % 2 == 0:
+                    edge_color[y, :] = [255, 210, 0]    # cyan in BGR
+                else:
+                    edge_color[y, :] = [200, 0, 255]    # magenta in BGR
+            edge_mask = (edges > 0).astype(np.float32)[:, :, np.newaxis] * 0.08
+            out = np.clip(out.astype(np.float32) + edge_color.astype(np.float32) * edge_mask,
+                          0, 255).astype(np.uint8)
+            # Random glitch: shift a horizontal slice
+            if random.random() < 0.015:
+                y0 = random.randint(0, h - 30)
+                sl_h = random.randint(10, 30)
+                shift = random.randint(-20, 20)
+                out[y0:y0+sl_h] = np.roll(out[y0:y0+sl_h], shift, axis=1)
+            return out
 
     # ── menu background ──────────────────────────────────────
 
