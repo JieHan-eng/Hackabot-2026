@@ -1,6 +1,6 @@
 # ROBO-HUNTER — Hackabot 2026
 
-A physical laser tag game. Aim a real gun at a moving robot and shoot — the laptop shows the robot's live camera feed as your FPS game view.
+A physical FPS game. Aim a real gun controller at a robot tank, shoot targets detected on its live camera feed, and drive the tank with a joystick — all displayed as an FPS view on your laptop.
 
 ---
 
@@ -15,151 +15,145 @@ python "video streaming.py"
 
 ---
 
-## Phone Stream Setup (Android)
+## Phone Stream Setup
 
-1. Install **IP Webcam** (Play Store, free)
-2. Open app → scroll to bottom → **Start server**
-3. Note the IP (e.g. `10.0.0.5`)
-4. In `video streaming.py`:
+The phone is strapped to the robot tank for a POV camera — it is not wired to the tank.
+
+1. Install **IP Webcam** (Android, free) or **DroidCam** (iOS)
+2. Open app → Start server → note the IP shown (e.g. `10.0.0.5`)
+3. In `video streaming.py`, set:
    ```python
    PHONE_IP = "10.0.0.5"
-   USE_WEBCAM_FALLBACK = False
    ```
-5. Phone and laptop must be on the same WiFi
+4. Phone and laptop must be on the **same WiFi**
 
-**iOS:** Use **DroidCam** (port 4747) or **IP Camera Lite** (port 8080) — same steps.
-
-**No phone?** Set `USE_WEBCAM_FALLBACK = True` — uses the laptop webcam.
+**No phone?** Set `USE_WEBCAM_FALLBACK = True` to use the laptop webcam instead.
 
 ---
 
 ## Controls
 
-| Key / Action  | Effect                        |
-|---------------|-------------------------------|
-| Mouse move    | Aim crosshair (testing only)  |
-| Left click / Space | Shoot                   |
-| R             | Reload                        |
-| D             | Simulate taking damage        |
-| [ / ]         | Volume down / up              |
-| F11           | Toggle fullscreen             |
-| ESC           | Quit                          |
+### Gun Controller (Pico 1)
 
-When **Pico 1** is connected via USB, mouse aim is replaced by the IMU sensor.
+| Action | Effect |
+|--------|--------|
+| Move gun physically | Aim crosshair (IMU tracking) |
+| Joystick 1 (left stick) | Drive tank (forward/back/steer) |
+| Fire joystick — pull | Shoot |
+| Fire joystick — push | Reload |
+| Fire joystick — press down (SW) | Centre crosshair |
+
+### Keyboard
+
+| Key | Effect |
+|-----|--------|
+| C | Centre crosshair |
+| Space | Shoot (testing without gun) |
+| R | Reload |
+| D | Simulate taking damage |
+| [ / ] | Volume down / up |
+| F11 | Toggle fullscreen |
+| ESC | Quit / back to menu |
 
 ---
 
-## Hardware Setup
+## Hardware
 
 ### Components
 
-| Component       | Role                                                    |
-|-----------------|---------------------------------------------------------|
-| Pico 1 (gun)    | BMI160 IMU aiming, joystick fire trigger, reload button, IR LED, USB serial to laptop |
-| Pico 2 (robot)  | Autonomous movement, servo launcher, IR receiver        |
-| nRF24L01+ ×2    | Wireless link — Pico 1 ↔ Pico 2                        |
-| L298N motor driver | Controls robot DC motors                             |
-| TSOP38238       | 38kHz IR receiver on robot — detects hits               |
-| Phone (on robot)| Streams camera to laptop over WiFi                      |
-
----
+| Component | Role |
+|-----------|------|
+| Pico 1 (gun) | BMI160 IMU aiming, 2 joysticks, nRF24 radio, USB serial to laptop |
+| Pico 2 (tank) | Receives commands via nRF24, drives DC motors |
+| nRF24L01+ x2 | Wireless link between gun and tank |
+| L298N | Motor driver for tank DC motors |
+| Phone | Strapped to tank, streams camera to laptop over WiFi |
 
 ### Pico 1 Wiring (Gun)
 
-| Component        | Pico pin                      |
-|------------------|-------------------------------|
-| BMI160 SDA       | GP4                           |
-| BMI160 SCL       | GP5                           |
-| nRF24 SCK        | GP10                          |
-| nRF24 MOSI       | GP11                          |
-| nRF24 MISO       | GP12                          |
-| nRF24 CSN        | GP13                          |
-| nRF24 CE         | GP9                           |
-| Joystick 1 X (steer) | GP26                     |
-| Joystick 1 Y (throttle) | GP27                  |
-| Joystick 2 Y (fire trigger) | GP28              |
-| Reload button    | GP15 → GND (pull-up)          |
-| IR LED           | GP16 → 100Ω → GND             |
+| Component | Pin |
+|-----------|-----|
+| BMI160 SDA / SCL | GP4 / GP5 |
+| Joystick 1 X (steer) | GP26 |
+| Joystick 1 Y (throttle) | GP27 |
+| Joystick 2 Y (fire trigger) | GP28 |
+| Joystick 2 SW (centre aim) | GP22 |
+| nRF24 SCK / MOSI / MISO | GP18 / GP19 / GP16 |
+| nRF24 CE / CSN | GP17 / GP20 |
+| IR LED (future) | GP14 |
+| Reload button (legacy) | GP15 |
 
-### Pico 2 Wiring (Robot)
+### Pico 2 Wiring (Tank)
 
-| Component        | Pico pin                      |
-|------------------|-------------------------------|
-| nRF24 SCK        | GP2                           |
-| nRF24 MOSI       | GP3                           |
-| nRF24 MISO       | GP4                           |
-| nRF24 CSN        | GP5                           |
-| nRF24 CE         | GP6                           |
-| IR Receiver OUT  | GP16                          |
-| L298N ENA (PWM)  | GP10                          |
-| L298N IN1        | GP11                          |
-| L298N IN2        | GP12                          |
-| L298N ENB (PWM)  | GP13                          |
-| L298N IN3        | GP14                          |
-| L298N IN4        | GP15                          |
-| Head pan servo   | GP20 (yaw — left/right)       |
-| Head tilt servo  | GP21 (pitch — up/down)        |
-| Launcher servo   | GP22                          |
+| Component | Pin |
+|-----------|-----|
+| nRF24 SCK / MOSI / MISO | GP18 / GP19 / GP16 |
+| nRF24 CE / CSN | GP17 / GP20 |
+| L298N IN1 / IN2 / ENA | GP2 / GP3 / GP6 (left motor) |
+| L298N IN3 / IN4 / ENB | GP7 / GP8 / GP9 (right motor) |
 
 ---
 
-### Flashing the Picos
+## Flashing the Picos
 
-1. Install **Thonny** or use `mpremote`
-2. Flash **MicroPython** firmware onto each Pico (download from micropython.org)
-3. Copy `pico1_gun.py` + `bmi160.py` → Pico 1 and save `pico1_gun.py` as `main.py`
-4. Copy `pico2_robot.py` → Pico 2 and save as `main.py`
+1. Hold BOOTSEL and plug in the Pico via USB
+2. Copy the MicroPython `.uf2` file to the drive that appears
+3. Wait for reboot, then upload files with `mpremote`:
 
----
-
-### Enabling Serial on the Laptop
-
-1. Plug Pico 1 into the laptop via USB
-2. Open Device Manager → Ports (COM & LPT) → note the COM port (e.g. `COM4`)
-3. In `video streaming.py`:
-   ```python
-   ENABLE_SERIAL = True
-   SERIAL_PORT   = "COM4"   # your port here
-   ```
-
----
-
-## Serial Protocol (Pico 1 → Laptop)
-
-All messages are newline-terminated ASCII over USB serial at 115200 baud.
-
-| Message         | Meaning                              |
-|-----------------|--------------------------------------|
-| `AIM:yaw,roll`  | IMU angles → moves crosshair        |
-| `SHOOT`         | Fire trigger deflected → fire        |
-| `RELOAD`        | Reload button pressed                |
-| `HIT`           | Robot's IR receiver was triggered    |
-
-**Re-zero the aim:** Hold reload + trigger simultaneously to reset yaw/pitch to centre.
-
----
-
-## Tuning
-
-All tuning values are at the top of each file.
-
-**`video streaming.py`**
-```python
-AIM_YAW_RANGE   = 45.0   # degrees of physical gun sweep = full screen width
-AIM_PITCH_RANGE = 20.0   # degrees of physical gun sweep = full screen height
-AIM_SMOOTHING   = 0.25   # crosshair smoothing (0 = raw, 1 = frozen)
-SOUND_VOLUME    = 0.8    # gunshot/hit/damage volume
-RELOAD_VOLUME   = 1.0    # reload sound volume
-MUSIC_VOLUME    = 0.4    # background music volume
-FULLSCREEN      = True   # launch fullscreen; F11 toggles
+**Gun Pico:**
+```
+mpremote cp pico1_gun.py :main.py
+mpremote cp bmi160.py :bmi160.py
+mpremote cp nrf24l01.py :nrf24l01.py
 ```
 
-**`pico1_gun.py`**
-```python
-SEND_HZ         = 50     # AIM update rate (Hz)
-FIRE_THRESHOLD  = 25     # joystick deflection % to count as firing
-JOY_DEADZONE    = 4000   # ADC units — ignores small joystick drift
+**Tank Pico:**
 ```
+mpremote cp pico2_robot.py :main.py
+mpremote cp nrf24l01.py :nrf24l01.py
+```
+
+---
+
+## Serial Protocol (Gun → Laptop)
+
+USB serial at 115200 baud. Messages are newline-terminated.
+
+| Message | Meaning |
+|---------|---------|
+| `AIM:yaw,roll` | IMU angles — moves crosshair |
+| `SHOOT` | Fire trigger pulled |
+| `RELOAD` | Fire joystick pushed |
+| `ZERO` | Joystick SW pressed — centres crosshair |
+
+---
+
+## Gameplay
+
+- Each round lasts **30 seconds**
+- Kill detected targets to score — **1 kill = 1 point**
+- Timer displays at the top of the screen (flashes red when <10s)
+- When time runs out, if you're in the **top 5**, you enter your name for the leaderboard
+
+## Leaderboard
+
+- Accessible from the map select menu (scroll down past the maps)
+- Displays the **top 5 scores** with player name, kills, and map played
+- Data is saved to `leaderboard.json` and **persists between sessions**
+
+---
+
+## Maps
+
+5 selectable maps, each with unique visual filters and atmosphere:
+
+- **Arctic Storm** — blizzard, frost edges, snow particles, breath fog
+- **Warzone** — sepia grade, rubble silhouette, smoke, firelight flicker
+- **Jungle Warfare** — green tint, vine borders, rain, lightning
+- **Night Ops** — night-vision goggles, NV noise, scope sway, phosphor glow
+- **Cyberpunk City** — neon edges, chromatic aberration, glitch effects, holo grid
+
+Detection (YOLOv8) runs on the **raw camera feed** before filters are applied.
 
 ---
 
@@ -167,18 +161,16 @@ JOY_DEADZONE    = 4000   # ADC units — ignores small joystick drift
 
 ```
 Hackabot-2026/
-├── video streaming.py   # Main game — laptop FPS display, detection, sounds
-├── pico1_gun.py         # Pico 1 firmware — gun controller (IMU + joystick + nRF24)
-├── pico2_robot.py       # Pico 2 firmware — robot controller (motors + servos + IR)
-├── bmi160.py            # BMI160 IMU driver (used by pico1_gun.py)
-├── yolov8n.pt           # YOLOv8 nano model for human detection
-├── revolver_shot.wav    # Gunshot sound effect
-├── revolver_reload.mp3  # Reload sound effect
-├── game_start_music.mp3 # In-game background music
-├── menu_music.mp3       # Menu background music
-└── motion_testing/      # IMU testing & visualisation utilities
-    ├── main.py
-    ├── read_gyro.py
-    ├── visualiser.py
-    └── bmi160.py
+├── video streaming.py    # Main game (laptop)
+├── pico1_gun.py          # Gun Pico firmware
+├── pico2_robot.py        # Tank Pico firmware
+├── bmi160.py             # BMI160 IMU driver
+├── nrf24l01.py           # nRF24L01+ radio driver
+├── yolov8n.pt            # YOLOv8 nano model
+├── revolver_shot.wav     # Gunshot sound
+├── revolver_reload.mp3   # Reload sound
+├── menu_select.mp3       # Menu selection sound
+├── game_start_music.mp3  # In-game music
+├── menu_music.mp3        # Menu music
+└── leaderboard.json      # Persistent top 5 scores (auto-created)
 ```

@@ -64,7 +64,7 @@ class NRF24L01:
             raise OSError("nRF24L01+ Hardware not responding")
 
         self.reg_write(DYNPD, 0)
-        self.reg_write(SETUP_RETR, (6 << 4) | 8)
+        self.reg_write(SETUP_RETR, (4 << 4) | 15)  # 250µs×5 delay, 15 retries (max)
         self.set_power_speed(POWER_3, SPEED_250K)
         self.set_crc(2)
         self.reg_write(STATUS, RX_DR | TX_DS | MAX_RT)

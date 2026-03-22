@@ -8,6 +8,7 @@ import random
 import threading
 import queue
 import os
+import json
 
 # Absolute path to the project folder — used for sound/music file loading
 _ASSETS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -230,6 +231,7 @@ MAP_DATA = [
     },
 ]
 MAP_NAMES = [m["name"] for m in MAP_DATA]
+LEADERBOARD_IDX = len(MAP_DATA)  # index of the leaderboard "entry" in the menu
 
 
 # ─── NPC ──────────────────────────────────────────────────────
@@ -464,6 +466,11 @@ class FPSGame:
         self.ammo           = 30
         self.max_ammo       = 30
         self.kills          = 0
+        self.round_time     = 30.0       # seconds per round
+        self._round_timer   = 30.0       # counts down during play
+        self._leaderboard   = self._load_leaderboard()
+        self._name_entry    = ""         # for name input screen
+        self._name_blink    = 0.0        # cursor blink timer
         self.hit_markers    = []
         self.damage_flash   = 0.0
         self.shoot_flash    = 0.0
@@ -671,7 +678,7 @@ class FPSGame:
             print(f"[!] snd_empty generation failed: {e}")
             self.snd_empty = None
 
-        # ── snd_menu_select: menu selection sound ──
+        # ── snd_menu_select: menu navigation sound ──
         try:
             _mp = os.path.join(_ASSETS_DIR, "menu_select.mp3")
             self.snd_menu_select = pygame.mixer.Sound(_mp)
@@ -680,10 +687,19 @@ class FPSGame:
             print(f"[!] menu_select.mp3 failed: {e}")
             self.snd_menu_select = None
 
+        # ── snd_option_select: map confirm / option chosen sound ──
+        try:
+            _op = os.path.join(_ASSETS_DIR, "option_select.mp3")
+            self.snd_option_select = pygame.mixer.Sound(_op)
+            print(f"[OK] Option select sound loaded: option_select.mp3")
+        except Exception as e:
+            print(f"[!] option_select.mp3 failed: {e}")
+            self.snd_option_select = None
+
         # Apply volumes — reload gets its own setting (often needs to be louder)
         for snd in (self.snd_shoot, self.snd_hit_tink,
                     self.snd_hit, self.snd_damage, self.snd_empty,
-                    self.snd_menu_select):
+                    self.snd_menu_select, self.snd_option_select):
             if snd is not None:
                 snd.set_volume(SOUND_VOLUME)
         if self.snd_reload is not None:
@@ -692,6 +708,10 @@ class FPSGame:
     def _play_menu_select(self):
         if self.snd_menu_select is not None:
             self.snd_menu_select.play()
+
+    def _play_option_select(self):
+        if self.snd_option_select is not None:
+            self.snd_option_select.play()
 
     def _set_volume(self, vol: float):
         """Set master volume for all sounds + music and show the HUD indicator."""
@@ -1503,14 +1523,12 @@ class FPSGame:
             targeted.engaged   = True
             self.hit_markers.append(
                 HitMarker(int(self.ch_x), int(self.ch_y), confirmed=True))
-            self.score += 50
-
             if targeted.health <= 0:
                 now = time.time()
                 targeted.dead_until      = now + 6.0   # 6 s respawn cooldown
                 targeted.kill_icon_until = now + 1.5   # skull visible for 1.5 s
                 self.kills += 1
-                self.score += 150   # kill bonus
+                self.score  = self.kills   # score = kills
                 self._play(self.snd_hit)
                 self.kill_feed.append([time.time(), "HOSTILE ELIMINATED"])
         else:
@@ -2040,11 +2058,15 @@ class FPSGame:
 
     def draw_score(self):
         x = WINDOW_W // 2
-        txt = self.font_hud.render(f"SCORE  {self.score:06d}", True, HUD_GREEN)
-        self.screen.blit(txt, txt.get_rect(centerx=x).move(0, 20))
+        # Timer — large, centered top, flashes red when <10s
+        secs = max(0, int(self._round_timer))
+        timer_col = (255, 60, 60) if secs < 10 else HUD_GREEN
+        timer_txt = self.font_big.render(f"{secs}", True, timer_col)
+        self.screen.blit(timer_txt, timer_txt.get_rect(centerx=x, top=8))
 
-        kills_txt = self.font_small.render(f"KILLS: {self.kills}", True, HUD_DIM)
-        self.screen.blit(kills_txt, kills_txt.get_rect(centerx=x).move(0, 60))
+        # Kills counter below timer
+        kills_txt = self.font_hud.render(f"KILLS  {self.kills}", True, HUD_GREEN)
+        self.screen.blit(kills_txt, kills_txt.get_rect(centerx=x, top=52))
 
     def draw_kill_feed(self):
         """Draw the last 4 kills on the right side, fading over 4 seconds."""
@@ -2188,11 +2210,39 @@ class FPSGame:
 
     # ── start new game ───────────────────────────────────────
 
+    # ── leaderboard persistence ─────────────────────────────
+
+    @staticmethod
+    def _load_leaderboard():
+        path = os.path.join(_ASSETS_DIR, "leaderboard.json")
+        try:
+            with open(path, "r") as f:
+                data = json.loads(f.read())
+                return sorted(data, key=lambda e: e["score"], reverse=True)[:5]
+        except Exception:
+            return []
+
+    def _save_leaderboard(self):
+        path = os.path.join(_ASSETS_DIR, "leaderboard.json")
+        with open(path, "w") as f:
+            f.write(json.dumps(self._leaderboard, indent=2))
+
+    def _is_top5(self, score):
+        if len(self._leaderboard) < 5:
+            return score > 0
+        return score > self._leaderboard[-1]["score"]
+
+    def _add_to_leaderboard(self, name, score, map_name):
+        self._leaderboard.append({"name": name, "score": score, "map": map_name})
+        self._leaderboard = sorted(self._leaderboard, key=lambda e: e["score"], reverse=True)[:5]
+        self._save_leaderboard()
+
     def _start_new_game(self):
         self.score          = 0
         self.health         = 100
         self.ammo           = self.max_ammo
         self.kills          = 0
+        self._round_timer   = self.round_time
         self.game_active    = True
         self.shoot_cooldown = 0.15
 
@@ -2452,14 +2502,15 @@ class FPSGame:
     def _draw_map_select_screen(self, dt: float):
         self._title_timer += dt
         m = self.current_map
-        self._draw_menu_bg(m, dt)
+        on_leaderboard = (m >= len(MAP_DATA))
+        bg_map = min(m, len(MAP_DATA) - 1)
+        self._draw_menu_bg(bg_map, dt)
 
         content_top = 74
         content_bot = WINDOW_H - 40
 
-        # ── LEFT PANEL: map list ─────────────────────────────────────────────
+        # ── LEFT PANEL: map list + leaderboard entry ────────────────────────
         panel_w = 340
-        # Semi-transparent left panel
         panel = pygame.Surface((panel_w, content_bot - content_top), pygame.SRCALPHA)
         panel.fill((0, 0, 0, 140))
         self.screen.blit(panel, (0, content_top))
@@ -2471,31 +2522,28 @@ class FPSGame:
 
         item_h = 54
         list_y = content_top + 44
+
+        # Draw map entries
         for i, md in enumerate(MAP_DATA):
             y = list_y + i * item_h
             accent = md["accent"]
             selected = (i == m)
 
             if selected:
-                # Highlight bar
                 hl = pygame.Surface((panel_w - 4, item_h - 6), pygame.SRCALPHA)
                 hl.fill((accent[0]//6, accent[1]//6, accent[2]//6, 200))
                 self.screen.blit(hl, (2, y))
-                # Left accent stripe
                 pygame.draw.rect(self.screen, accent, (0, y, 4, item_h - 6))
 
-            # Map index number
             num_col = accent if selected else (50, 55, 50)
             num = self.font_small.render(f"{i+1:02d}", True, num_col)
             self.screen.blit(num, (14, y + 10))
 
-            # Map name
             name_col = (255, 255, 255) if selected else (130, 140, 130)
             name_font = self.font_med if selected else self.font_small
             name_surf = name_font.render(md["name"], True, name_col)
             self.screen.blit(name_surf, (50, y + (item_h // 2 - name_surf.get_height() // 2) - 3))
 
-            # Tags on selected
             if selected:
                 tx = 50
                 for tag in md["tags"][:2]:
@@ -2503,89 +2551,189 @@ class FPSGame:
                     self.screen.blit(ts, (tx, y + item_h - 20))
                     tx += ts.get_width() + 12
 
-        # ── RIGHT PANEL: map preview ─────────────────────────────────────────
+        # Draw leaderboard entry
+        lb_y = list_y + len(MAP_DATA) * item_h
+        # Separator line
+        pygame.draw.line(self.screen, (40, 50, 40),
+                         (24, lb_y - 4), (panel_w - 24, lb_y - 4), 1)
+        lb_accent = (255, 215, 0)  # gold
+        lb_selected = on_leaderboard
+        if lb_selected:
+            hl = pygame.Surface((panel_w - 4, item_h - 6), pygame.SRCALPHA)
+            hl.fill((lb_accent[0]//6, lb_accent[1]//6, lb_accent[2]//6, 200))
+            self.screen.blit(hl, (2, lb_y))
+            pygame.draw.rect(self.screen, lb_accent, (0, lb_y, 4, item_h - 6))
+
+        trophy = self.font_small.render(">>", True, lb_accent if lb_selected else (50, 55, 50))
+        self.screen.blit(trophy, (14, lb_y + 10))
+        lb_name_col = (255, 255, 255) if lb_selected else (130, 140, 130)
+        lb_font = self.font_med if lb_selected else self.font_small
+        lb_name = lb_font.render("LEADERBOARD", True, lb_name_col)
+        self.screen.blit(lb_name, (50, lb_y + (item_h // 2 - lb_name.get_height() // 2) - 3))
+        if lb_selected:
+            ts = self.font_small.render("TOP 5", True, lb_accent)
+            self.screen.blit(ts, (50, lb_y + item_h - 20))
+
+        # ── RIGHT PANEL ─────────────────────────────────────────────────────
         right_x = panel_w + 20
         right_w  = WINDOW_W - right_x - 20
         right_h  = content_bot - content_top - 10
         right_y  = content_top + 5
 
-        md = MAP_DATA[m]
-        accent = md["accent"]
-        bg_col = md["bg"]
+        if on_leaderboard:
+            # ── LEADERBOARD VIEW ──
+            accent = lb_accent
+            # Dark background
+            bg = pygame.Surface((right_w, right_h), pygame.SRCALPHA)
+            bg.fill((0, 0, 0, 200))
+            self.screen.blit(bg, (right_x, right_y))
 
-        # Panel background — gradient
-        for i in range(right_h):
-            alpha = i / right_h
-            r = int(bg_col[0] * (1 - alpha * 0.6))
-            g = int(bg_col[1] * (1 - alpha * 0.6))
-            b = int(bg_col[2] * (1 - alpha * 0.6))
-            pygame.draw.line(self.screen, (r, g, b),
-                             (right_x, right_y + i), (right_x + right_w, right_y + i))
+            # Animated corner brackets
+            t = self._title_timer
+            blen = int(30 + 20 * abs(math.sin(t * 1.5)))
+            bthk = 2
+            corners = [
+                (right_x + 8, right_y + 8),
+                (right_x + right_w - 8, right_y + 8),
+                (right_x + 8, right_y + right_h - 8),
+                (right_x + right_w - 8, right_y + right_h - 8),
+            ]
+            dirs = [(1, 1), (-1, 1), (1, -1), (-1, -1)]
+            for (cx, cy), (dx, dy) in zip(corners, dirs):
+                pygame.draw.line(self.screen, accent, (cx, cy), (cx + blen * dx, cy), bthk)
+                pygame.draw.line(self.screen, accent, (cx, cy), (cx, cy + blen * dy), bthk)
 
-        # Terrain silhouette at the bottom of the right panel
-        terrain_h = int(right_h * 0.42)
-        self._draw_map_terrain(right_x, right_y + right_h - terrain_h,
-                               right_w, terrain_h, md["filter"], accent)
+            nx = right_x + right_w // 2
 
-        # Animated corner brackets
-        t = self._title_timer
-        blen = int(30 + 20 * abs(math.sin(t * 1.5)))
-        bthk = 2
-        corners = [
-            (right_x + 8, right_y + 8),
-            (right_x + right_w - 8, right_y + 8),
-            (right_x + 8, right_y + right_h - 8),
-            (right_x + right_w - 8, right_y + right_h - 8),
-        ]
-        dirs = [(1, 1), (-1, 1), (1, -1), (-1, -1)]
-        for (cx, cy), (dx, dy) in zip(corners, dirs):
-            pygame.draw.line(self.screen, accent, (cx, cy), (cx + blen * dx, cy), bthk)
-            pygame.draw.line(self.screen, accent, (cx, cy), (cx, cy + blen * dy), bthk)
+            # Title
+            title = self.font_big.render("LEADERBOARD", True, accent)
+            self.screen.blit(title, title.get_rect(center=(nx, right_y + 50)))
+            tw = title.get_width()
+            pygame.draw.line(self.screen, accent,
+                             (nx - tw // 2, right_y + 75), (nx + tw // 2, right_y + 75), 2)
 
-        # Map name — large
-        name_shadow = self.font_big.render(md["name"], True, (0, 0, 0))
-        name_surf   = self.font_big.render(md["name"], True, accent)
-        nx = right_x + right_w // 2
-        ny = right_y + right_h // 2 - 80
-        self.screen.blit(name_shadow, name_shadow.get_rect(center=(nx + 3, ny + 3)))
-        self.screen.blit(name_surf,   name_surf.get_rect(center=(nx, ny)))
+            # Column headers
+            hdr_y = right_y + 100
+            self.screen.blit(self.font_small.render("RANK", True, (120, 130, 110)),
+                             (right_x + 40, hdr_y))
+            self.screen.blit(self.font_small.render("NAME", True, (120, 130, 110)),
+                             (right_x + 120, hdr_y))
+            self.screen.blit(self.font_small.render("KILLS", True, (120, 130, 110)),
+                             (right_x + right_w - 160, hdr_y))
+            self.screen.blit(self.font_small.render("MAP", True, (120, 130, 110)),
+                             (right_x + right_w - 80, hdr_y))
+            pygame.draw.line(self.screen, (40, 50, 40),
+                             (right_x + 30, hdr_y + 20), (right_x + right_w - 30, hdr_y + 20), 1)
 
-        # Accent line under name
-        nw = name_surf.get_width()
-        pygame.draw.line(self.screen, accent,
-                         (nx - nw // 2, ny + 30), (nx + nw // 2, ny + 30), 2)
+            # Entries
+            row_h = 55
+            for i in range(5):
+                ey = hdr_y + 30 + i * row_h
+                if i < len(self._leaderboard):
+                    entry = self._leaderboard[i]
+                    # Rank colors: gold, silver, bronze, then dim
+                    rank_cols = [(255, 215, 0), (200, 200, 210), (205, 127, 50),
+                                 (140, 150, 140), (140, 150, 140)]
+                    rc = rank_cols[i]
+                    rank_txt = self.font_hud.render(f"#{i+1}", True, rc)
+                    self.screen.blit(rank_txt, (right_x + 40, ey))
+                    name_txt = self.font_hud.render(entry["name"][:12], True, (240, 240, 240))
+                    self.screen.blit(name_txt, (right_x + 120, ey))
+                    score_txt = self.font_hud.render(str(entry["score"]), True, accent)
+                    self.screen.blit(score_txt, (right_x + right_w - 160, ey))
+                    map_txt = self.font_small.render(entry.get("map", "")[:10], True, (100, 110, 100))
+                    self.screen.blit(map_txt, (right_x + right_w - 80, ey + 8))
+                else:
+                    # Empty slot
+                    rank_txt = self.font_hud.render(f"#{i+1}", True, (50, 55, 50))
+                    self.screen.blit(rank_txt, (right_x + 40, ey))
+                    dash = self.font_hud.render("---", True, (50, 55, 50))
+                    self.screen.blit(dash, (right_x + 120, ey))
 
-        # Subtitle
-        sub = self.font_med.render(md["sub"], True, (160, 165, 155))
-        self.screen.blit(sub, sub.get_rect(center=(nx, ny + 55)))
+                if i < 4:
+                    pygame.draw.line(self.screen, (30, 35, 30),
+                                     (right_x + 30, ey + row_h - 5),
+                                     (right_x + right_w - 30, ey + row_h - 5), 1)
 
-        # Tags row
-        tag_total_w = sum(
-            self.font_small.size(f"  {tag}  ")[0] + 6 for tag in md["tags"]
-        )
-        tx = nx - tag_total_w // 2
-        ty = ny + 90
-        for tag in md["tags"]:
-            tw, th = self.font_small.size(f"  {tag}  ")
-            pygame.draw.rect(self.screen, (int(accent[0]*0.18), int(accent[1]*0.18), int(accent[2]*0.18)),
-                             (tx, ty, tw + 6, th + 6), border_radius=3)
-            pygame.draw.rect(self.screen, accent, (tx, ty, tw + 6, th + 6), 1, border_radius=3)
-            ts = self.font_small.render(f"  {tag}  ", True, accent)
-            self.screen.blit(ts, (tx + 3, ty + 3))
-            tx += tw + 6 + 8
+            # Scanline sweep
+            sweep_y = right_y + int((self._title_timer * 80) % right_h)
+            sl = pygame.Surface((right_w, 2), pygame.SRCALPHA)
+            sl.fill((accent[0], accent[1], accent[2], 14))
+            self.screen.blit(sl, (right_x, sweep_y))
 
-        # "DEPLOY" button — animated
-        pulse = 0.6 + 0.4 * math.sin(self._title_timer * 3.0)
-        btn_col  = (int(accent[0] * pulse), int(accent[1] * pulse), int(accent[2] * pulse))
-        btn_surf = self.font_hud.render("[ SPACE ]  DEPLOY", True, btn_col)
-        by = right_y + right_h - 60
-        self.screen.blit(btn_surf, btn_surf.get_rect(center=(nx, by)))
+        else:
+            # ── MAP PREVIEW (existing) ──
+            md = MAP_DATA[m]
+            accent = md["accent"]
+            bg_col = md["bg"]
 
-        # Scanline sweep across right panel
-        sweep_y = right_y + int((self._title_timer * 80) % right_h)
-        sl = pygame.Surface((right_w, 2), pygame.SRCALPHA)
-        sl.fill((accent[0], accent[1], accent[2], 14))
-        self.screen.blit(sl, (right_x, sweep_y))
+            # Panel background — gradient
+            for i in range(right_h):
+                alpha = i / right_h
+                r = int(bg_col[0] * (1 - alpha * 0.6))
+                g = int(bg_col[1] * (1 - alpha * 0.6))
+                b = int(bg_col[2] * (1 - alpha * 0.6))
+                pygame.draw.line(self.screen, (r, g, b),
+                                 (right_x, right_y + i), (right_x + right_w, right_y + i))
+
+            terrain_h = int(right_h * 0.42)
+            self._draw_map_terrain(right_x, right_y + right_h - terrain_h,
+                                   right_w, terrain_h, md["filter"], accent)
+
+            # Animated corner brackets
+            t = self._title_timer
+            blen = int(30 + 20 * abs(math.sin(t * 1.5)))
+            bthk = 2
+            corners = [
+                (right_x + 8, right_y + 8),
+                (right_x + right_w - 8, right_y + 8),
+                (right_x + 8, right_y + right_h - 8),
+                (right_x + right_w - 8, right_y + right_h - 8),
+            ]
+            dirs = [(1, 1), (-1, 1), (1, -1), (-1, -1)]
+            for (cx, cy), (dx, dy) in zip(corners, dirs):
+                pygame.draw.line(self.screen, accent, (cx, cy), (cx + blen * dx, cy), bthk)
+                pygame.draw.line(self.screen, accent, (cx, cy), (cx, cy + blen * dy), bthk)
+
+            # Map name — large
+            name_shadow = self.font_big.render(md["name"], True, (0, 0, 0))
+            name_surf   = self.font_big.render(md["name"], True, accent)
+            nx = right_x + right_w // 2
+            ny = right_y + right_h // 2 - 80
+            self.screen.blit(name_shadow, name_shadow.get_rect(center=(nx + 3, ny + 3)))
+            self.screen.blit(name_surf,   name_surf.get_rect(center=(nx, ny)))
+
+            nw = name_surf.get_width()
+            pygame.draw.line(self.screen, accent,
+                             (nx - nw // 2, ny + 30), (nx + nw // 2, ny + 30), 2)
+
+            sub = self.font_med.render(md["sub"], True, (160, 165, 155))
+            self.screen.blit(sub, sub.get_rect(center=(nx, ny + 55)))
+
+            tag_total_w = sum(
+                self.font_small.size(f"  {tag}  ")[0] + 6 for tag in md["tags"]
+            )
+            tx = nx - tag_total_w // 2
+            ty = ny + 90
+            for tag in md["tags"]:
+                tw, th = self.font_small.size(f"  {tag}  ")
+                pygame.draw.rect(self.screen, (int(accent[0]*0.18), int(accent[1]*0.18), int(accent[2]*0.18)),
+                                 (tx, ty, tw + 6, th + 6), border_radius=3)
+                pygame.draw.rect(self.screen, accent, (tx, ty, tw + 6, th + 6), 1, border_radius=3)
+                ts = self.font_small.render(f"  {tag}  ", True, accent)
+                self.screen.blit(ts, (tx + 3, ty + 3))
+                tx += tw + 6 + 8
+
+            pulse = 0.6 + 0.4 * math.sin(self._title_timer * 3.0)
+            btn_col  = (int(accent[0] * pulse), int(accent[1] * pulse), int(accent[2] * pulse))
+            btn_surf = self.font_hud.render("[ SPACE ]  DEPLOY", True, btn_col)
+            by = right_y + right_h - 60
+            self.screen.blit(btn_surf, btn_surf.get_rect(center=(nx, by)))
+
+            sweep_y = right_y + int((self._title_timer * 80) % right_h)
+            sl = pygame.Surface((right_w, 2), pygame.SRCALPHA)
+            sl.fill((accent[0], accent[1], accent[2], 14))
+            self.screen.blit(sl, (right_x, sweep_y))
 
     # ── pre-calibration countdown ──────────────────────────────
 
@@ -2739,6 +2887,63 @@ class FPSGame:
         map_label = self.font_small.render(f"MAP:  {MAP_DATA[m]['name']}  //  {MAP_DATA[m]['sub']}", True, (70, 80, 70))
         self.screen.blit(map_label, map_label.get_rect(center=(WINDOW_W // 2, WINDOW_H - 30)))
 
+    # ── name entry screen ────────────────────────────────────
+
+    def _draw_name_entry_screen(self, dt: float):
+        m = self.current_map
+        accent = MAP_DATA[m]["accent"]
+        self._name_blink += dt
+
+        overlay = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 220))
+        self.screen.blit(overlay, (0, 0))
+
+        cx = WINDOW_W // 2
+        cy = WINDOW_H // 2
+
+        # Title
+        title = self.font_big.render("NEW HIGH SCORE!", True, (255, 215, 0))
+        self.screen.blit(title, title.get_rect(center=(cx, cy - 140)))
+
+        # Score display
+        score_txt = self.font_hud.render(f"KILLS: {self.kills}", True, accent)
+        self.screen.blit(score_txt, score_txt.get_rect(center=(cx, cy - 90)))
+
+        # Prompt
+        prompt = self.font_med.render("ENTER YOUR NAME", True, (160, 165, 155))
+        self.screen.blit(prompt, prompt.get_rect(center=(cx, cy - 40)))
+
+        # Name input box
+        box_w, box_h = 400, 60
+        bx = cx - box_w // 2
+        by = cy - box_h // 2
+        pygame.draw.rect(self.screen, (0, 0, 0), (bx, by, box_w, box_h))
+        pygame.draw.rect(self.screen, accent, (bx, by, box_w, box_h), 2)
+
+        # Name text + blinking cursor
+        cursor = "_" if int(self._name_blink * 2) % 2 == 0 else ""
+        display = self._name_entry + cursor
+        name_surf = self.font_big.render(display, True, (255, 255, 255))
+        self.screen.blit(name_surf, name_surf.get_rect(center=(cx, cy)))
+
+        # Hint
+        hint = self.font_small.render("PRESS ENTER TO CONFIRM  (MAX 12 CHARS)", True, (80, 90, 80))
+        self.screen.blit(hint, hint.get_rect(center=(cx, cy + 60)))
+
+        # Leaderboard preview below
+        lb_y = cy + 100
+        hdr = self.font_small.render("CURRENT TOP 5", True, (120, 130, 110))
+        self.screen.blit(hdr, hdr.get_rect(center=(cx, lb_y)))
+        pygame.draw.line(self.screen, (40, 50, 40),
+                         (cx - 150, lb_y + 16), (cx + 150, lb_y + 16), 1)
+        for i, entry in enumerate(self._leaderboard[:5]):
+            ey = lb_y + 24 + i * 24
+            rank_cols = [(255, 215, 0), (200, 200, 210), (205, 127, 50),
+                         (140, 150, 140), (140, 150, 140)]
+            txt = self.font_small.render(
+                f"#{i+1}  {entry['name'][:12]:12s}  {entry['score']}", True, rank_cols[i])
+            self.screen.blit(txt, txt.get_rect(center=(cx, ey)))
+
     # ── main loop ────────────────────────────────────────────
 
     def run(self):
@@ -2797,22 +3002,35 @@ class FPSGame:
                     # ── Menu / state navigation ──
                     if self.state == "TITLE":
                         if event.key == pygame.K_SPACE:
-                            self._play_menu_select()
+                            self._play_option_select()
                             self.state = "MAP_SELECT"
                     elif self.state == "MAP_SELECT":
+                        menu_count = len(MAP_DATA) + 1  # maps + leaderboard
                         if event.key == pygame.K_UP:
                             self._play_menu_select()
-                            self.current_map = (self.current_map - 1) % len(MAP_DATA)
+                            self.current_map = (self.current_map - 1) % menu_count
                         elif event.key == pygame.K_DOWN:
                             self._play_menu_select()
-                            self.current_map = (self.current_map + 1) % len(MAP_DATA)
+                            self.current_map = (self.current_map + 1) % menu_count
                         elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
-                            self._play_menu_select()
-                            self.state = "PRE_CALIB"
-                            self._pre_calib_timer = 3.0
+                            if self.current_map < len(MAP_DATA):  # only deploy on actual maps
+                                self._play_option_select()
+                                self.state = "PRE_CALIB"
+                                self._pre_calib_timer = 3.0
+                    elif self.state == "NAME_ENTRY":
+                        if event.key == pygame.K_RETURN:
+                            name = self._name_entry.strip() or "ANON"
+                            self._add_to_leaderboard(name, self.score,
+                                                     MAP_DATA[self.current_map]["name"])
+                            self._play_option_select()
+                            self.state = "END"
+                        elif event.key == pygame.K_BACKSPACE:
+                            self._name_entry = self._name_entry[:-1]
+                        elif len(self._name_entry) < 12 and event.unicode.isprintable() and event.unicode:
+                            self._name_entry += event.unicode.upper()
                     elif self.state == "END":
                         if event.key == pygame.K_r:
-                            self._play_menu_select()
+                            self._play_option_select()
                             self.state = "TITLE"
                             self._title_timer = 0.0
                             self._set_music("menu")
@@ -2856,9 +3074,18 @@ class FPSGame:
             # ── UPDATE ──────────────────────────────────────
             if self.state == "PLAYING":
                 self.update(dt)
-                # Transition to END when health depleted
+                # Count down the round timer
+                self._round_timer -= dt
+                if self._round_timer <= 0:
+                    self._round_timer = 0
+                    self.game_active = False
                 if not self.game_active:
-                    self.state = "END"
+                    # Check if top 5
+                    if self._is_top5(self.score):
+                        self._name_entry = ""
+                        self.state = "NAME_ENTRY"
+                    else:
+                        self.state = "END"
 
             # ── DRAW ────────────────────────────────────────
             self.screen.fill((0, 0, 0))
@@ -2961,6 +3188,10 @@ class FPSGame:
 
             # Damage flash (on top of everything)
             self.draw_damage_flash()
+
+            # NAME_ENTRY — high score name input
+            if self.state == "NAME_ENTRY":
+                self._draw_name_entry_screen(dt)
 
             # END state — show debrief overlay on top of frozen frame
             if self.state == "END":
